@@ -126,13 +126,25 @@ def get_org_materials(org_id, user):
 def get_events(org_id, user):
     return get_df("""
         SELECT e.event_id, et.code AS event_type, u.full_name AS operator, u.role,
-            i.serial_number AS instrument, e.local_timestamp, e.visibility, e.location_text
+            i.serial_number AS instrument, e.local_timestamp, e.visibility, e.location_text,
+            sd.value_text AS soft_data,
+            GROUP_CONCAT(DISTINCT el.linked_event_id) AS linked_event_ids,
+            GROUP_CONCAT(DISTINCT r.analyte || '=' || ROUND(r.value, 2) || COALESCE(r.unit, '')) AS results,
+            sud.amount_added_tonnes, od.amount_tonnes AS order_amount_tonnes,
+            dd.status AS delivery_status
         FROM event e
         JOIN event_type et ON et.event_type_id=e.event_type_id
         LEFT JOIN user_account u ON u.user_id=e.operator_user_id
         LEFT JOIN instrument i ON i.instrument_id=e.instrument_id
+        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
+        LEFT JOIN event_link el ON el.event_id=e.event_id
+        LEFT JOIN result r ON r.event_id=e.event_id
+        LEFT JOIN silo_update_detail sud ON sud.silo_update_event_id=e.event_id
+        LEFT JOIN order_detail od ON od.order_event_id=e.event_id
+        LEFT JOIN delivery_detail dd ON dd.delivery_event_id=e.event_id
         WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
           AND e.organization_id=?
+        GROUP BY e.event_id
         ORDER BY e.local_timestamp DESC
     """, event_access_params(user, org_id))
 
@@ -334,4 +346,50 @@ def get_assignable_farm_updates(org_id, user):
         LIMIT 100
         """,
         event_access_params(user, org_id),
+    )
+
+
+def get_orderable_blocks(user):
+    """Public/shared farm or silo update blocks that can be ordered from the event map."""
+    return get_df(
+        """
+        SELECT e.event_id, et.code AS event_type, e.organization_id AS seller_org_id,
+               o.name AS seller, e.local_timestamp, e.visibility,
+               COALESCE(sud.amount_added_tonnes, 0) AS available_tonnes,
+               sd.value_text AS note
+        FROM event e
+        JOIN event_type et ON et.event_type_id=e.event_type_id
+        JOIN organization o ON o.organization_id=e.organization_id
+        LEFT JOIN silo_update_detail sud ON sud.silo_update_event_id=e.event_id
+        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
+        WHERE e.visibility IN (?, ?)
+          AND et.code IN ('SILO_UPDATE', 'FARM_UPDATE')
+          AND e.organization_id<>?
+        ORDER BY e.local_timestamp DESC, e.event_id DESC
+        LIMIT 200
+        """,
+        (READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"])),
+    )
+
+
+def get_deliverable_orders(user):
+    """Readable order blocks that do not have a delivery block yet."""
+    return get_df(
+        """
+        SELECT e.event_id AS order_event_id, e.organization_id AS buyer_org_id,
+               buyer.name AS buyer, seller.name AS seller, e.local_timestamp,
+               e.visibility, od.source_event_id, od.amount_tonnes, od.status,
+               sd.value_text AS note
+        FROM order_detail od
+        JOIN event e ON e.event_id=od.order_event_id
+        JOIN organization buyer ON buyer.organization_id=e.organization_id
+        JOIN organization seller ON seller.organization_id=od.seller_org_id
+        LEFT JOIN delivery_detail dd ON dd.order_event_id=od.order_event_id
+        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND dd.order_event_id IS NULL
+        ORDER BY e.local_timestamp DESC, e.event_id DESC
+        LIMIT 200
+        """,
+        (READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"])),
     )

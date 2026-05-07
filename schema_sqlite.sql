@@ -267,3 +267,18 @@ CREATE INDEX idx_silo_organization
 
 CREATE INDEX idx_farm_detail_organization
   ON farm_detail(organization_id);
+
+CREATE INDEX idx_result_event_analyte
+  ON result(event_id, analyte);
+
+CREATE INDEX idx_soft_data_event
+  ON soft_data(event_id);
+
+CREATE INDEX idx_silo_update_source
+  ON silo_update_detail(source_farm_update_event_id);
+
+CREATE INDEX idx_order_source
+  ON order_detail(source_event_id, seller_org_id);
+
+CREATE INDEX idx_delivery_order
+  ON delivery_detail(order_event_id, source_event_id);

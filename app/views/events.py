@@ -59,7 +59,7 @@ def render():
 
     # ── Table ────────────────────────────────────────────────
     st.dataframe(
-        filtered[["event_id","event_type","operator","role","instrument","local_timestamp","visibility","location_text"]]
+        filtered[["event_id","event_type","operator","role","instrument","local_timestamp","visibility","location_text","soft_data","results","linked_event_ids","amount_added_tonnes","order_amount_tonnes","delivery_status"]]
         .rename(columns={
             "event_id":       "ID",
             "event_type":     "Type",
@@ -69,6 +69,12 @@ def render():
             "local_timestamp":"Timestamp",
             "visibility":     "Visibility",
             "location_text":  "Location",
+            "soft_data":      "Soft data / block note",
+            "results":        "Results",
+            "linked_event_ids":"Referenced event blocks",
+            "amount_added_tonnes":"Stored (t)",
+            "order_amount_tonnes":"Ordered (t)",
+            "delivery_status":"Delivery",
         })
         .reset_index(drop=True),
         use_container_width=True,

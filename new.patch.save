@@ -1,0 +1,807 @@
+diff --git a/app/db.py b/app/db.py
+index 499368914c5ed13c86c29c5c461d59ddabd8c1cf..b35420ba9e92efe5fe9aecf8d694361eb28946d4 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -104,57 +104,69 @@ def get_organizations(user):
+         LEFT JOIN farm_detail fd ON fd.organization_id=o.organization_id
+         GROUP BY o.organization_id ORDER BY o.name
+     """, (
+         READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]),
+     ))
+ 
+ 
+ def get_silos(org_id, user):
+     return get_df("""
+         SELECT s.silo_id, s.name, s.lat, s.lon, s.capacity_tonnes, m.name AS material
+         FROM silo s LEFT JOIN material m ON m.material_id=s.material_id
+         WHERE s.organization_id=?
+     """, (org_id,))
+ 
+ 
+ def get_org_materials(org_id, user):
+     return get_df("""
+         SELECT m.name, m.category FROM org_material om
+         JOIN material m ON m.material_id=om.material_id WHERE om.organization_id=?
+     """, (org_id,))
+ 
+ 
+ def get_events(org_id, user):
+     return get_df("""
+         SELECT e.event_id, et.code AS event_type, u.full_name AS operator, u.role,
+-            i.serial_number AS instrument, e.local_timestamp, e.visibility, e.location_text
++            i.serial_number AS instrument, e.local_timestamp, e.visibility, e.location_text,
++            sd.value_text AS soft_data,
++            GROUP_CONCAT(DISTINCT el.linked_event_id) AS linked_event_ids,
++            GROUP_CONCAT(DISTINCT r.analyte || '=' || ROUND(r.value, 2) || COALESCE(r.unit, '')) AS results,
++            sud.amount_added_tonnes, od.amount_tonnes AS order_amount_tonnes,
++            dd.status AS delivery_status
+         FROM event e
+         JOIN event_type et ON et.event_type_id=e.event_type_id
+         LEFT JOIN user_account u ON u.user_id=e.operator_user_id
+         LEFT JOIN instrument i ON i.instrument_id=e.instrument_id
++        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
++        LEFT JOIN event_link el ON el.event_id=e.event_id
++        LEFT JOIN result r ON r.event_id=e.event_id
++        LEFT JOIN silo_update_detail sud ON sud.silo_update_event_id=e.event_id
++        LEFT JOIN order_detail od ON od.order_event_id=e.event_id
++        LEFT JOIN delivery_detail dd ON dd.delivery_event_id=e.event_id
+         WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+           AND e.organization_id=?
++        GROUP BY e.event_id
+         ORDER BY e.local_timestamp DESC
+     """, event_access_params(user, org_id))
+ 
+ 
+ def get_results_for_org(org_id, user):
+     return get_df("""
+         SELECT r.analyte, r.value, r.unit, e.local_timestamp, m.name AS material
+         FROM result r
+         JOIN event e ON e.event_id=r.event_id
+         JOIN sample s ON s.sample_id=e.sample_id
+         JOIN material m ON m.material_id=s.material_id
+         WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+           AND e.organization_id=?
+         ORDER BY e.local_timestamp DESC
+     """, event_access_params(user, org_id))
+ 
+ 
+ def get_last_measurement(org_id, user):
+     con = get_con()
+     row = con.execute("""
+         SELECT e.local_timestamp, e.location_text FROM event e
+         JOIN event_type et ON et.event_type_id=e.event_type_id
+         WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+           AND e.organization_id=?
+           AND et.code='MEASUREMENT'
+@@ -313,25 +325,71 @@ def get_floating_measurements(org_id, user):
+         GROUP BY e.event_id
+         ORDER BY e.local_timestamp DESC
+         LIMIT 100
+         """,
+         event_access_params(user, org_id),
+     )
+ 
+ 
+ def get_assignable_farm_updates(org_id, user):
+     return get_df(
+         """
+         SELECT e.event_id, e.local_timestamp, e.visibility, sd.value_text AS note
+         FROM event e
+         JOIN event_type et ON et.event_type_id=e.event_type_id
+         LEFT JOIN soft_data sd ON sd.event_id=e.event_id
+         LEFT JOIN silo_update_detail sud ON sud.source_farm_update_event_id=e.event_id
+         WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+           AND e.organization_id=?
+           AND et.code='FARM_UPDATE'
+           AND sud.source_farm_update_event_id IS NULL
+         ORDER BY e.local_timestamp DESC
+         LIMIT 100
+         """,
+         event_access_params(user, org_id),
+     )
++
++
++def get_orderable_blocks(user):
++    """Public/shared farm or silo update blocks that can be ordered from the event map."""
++    return get_df(
++        """
++        SELECT e.event_id, et.code AS event_type, e.organization_id AS seller_org_id,
++               o.name AS seller, e.local_timestamp, e.visibility,
++               COALESCE(sud.amount_added_tonnes, 0) AS available_tonnes,
++               sd.value_text AS note
++        FROM event e
++        JOIN event_type et ON et.event_type_id=e.event_type_id
++        JOIN organization o ON o.organization_id=e.organization_id
++        LEFT JOIN silo_update_detail sud ON sud.silo_update_event_id=e.event_id
++        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
++        WHERE e.visibility IN (?, ?)
++          AND et.code IN ('SILO_UPDATE', 'FARM_UPDATE')
++          AND e.organization_id<>?
++        ORDER BY e.local_timestamp DESC, e.event_id DESC
++        LIMIT 200
++        """,
++        (READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"])),
++    )
++
++
++def get_deliverable_orders(user):
++    """Readable order blocks that do not have a delivery block yet."""
++    return get_df(
++        """
++        SELECT e.event_id AS order_event_id, e.organization_id AS buyer_org_id,
++               buyer.name AS buyer, seller.name AS seller, e.local_timestamp,
++               e.visibility, od.source_event_id, od.amount_tonnes, od.status,
++               sd.value_text AS note
++        FROM order_detail od
++        JOIN event e ON e.event_id=od.order_event_id
++        JOIN organization buyer ON buyer.organization_id=e.organization_id
++        JOIN organization seller ON seller.organization_id=od.seller_org_id
++        LEFT JOIN delivery_detail dd ON dd.order_event_id=od.order_event_id
++        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
++        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
++          AND dd.order_event_id IS NULL
++        ORDER BY e.local_timestamp DESC, e.event_id DESC
++        LIMIT 200
++        """,
++        (READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"])),
++    )
+diff --git a/app/services/farm_service.py b/app/services/farm_service.py
+index d93bb959d095e62baf0c671f9a8bf5a6e778f47a..36622f7a74a44ac7e93d036e7e18ef52270cceef 100644
+--- a/app/services/farm_service.py
++++ b/app/services/farm_service.py
+@@ -1,27 +1,27 @@
+ """Transactional farm, measurement-assignment, and silo mutations with ledger events."""
+-import datetime
++import datetime, json
+ 
+ from access_control import can_edit_org
+ from config import PRIVATE_VISIBILITY, VALID_EVENT_VISIBILITY
+ from db import get_con
+ 
+ 
+ class PermissionDenied(ValueError):
+     pass
+ 
+ 
+ def require_org_editor(user, org_id):
+     if not can_edit_org(user, org_id):
+         raise PermissionDenied("Only users from the same organization can edit these records.")
+ 
+ 
+ def create_event(cur, org_id, operator_id, event_type_code, note, visibility=PRIVATE_VISIBILITY, lat=None, lon=None, payload_json=None, linked_event_id=None, relationship="SOURCE_BLOCK"):
+     if visibility not in VALID_EVENT_VISIBILITY:
+         raise ValueError("Invalid event visibility.")
+     et_id = cur.execute("SELECT event_type_id FROM event_type WHERE code=?", (event_type_code,)).fetchone()[0]
+     prev = cur.execute(
+         "SELECT event_id FROM event WHERE organization_id=? ORDER BY event_id DESC LIMIT 1",
+         (org_id,),
+     ).fetchone()
+     prev_id = prev[0] if prev else None
+     now = datetime.datetime.now(datetime.UTC).isoformat()
+@@ -45,55 +45,58 @@ def create_event(cur, org_id, operator_id, event_type_code, note, visibility=PRI
+         )
+     return event_id
+ 
+ 
+ def create_farm_update_event(cur, org_id, operator_id, note, visibility=PRIVATE_VISIBILITY, lat=None, lon=None, payload_json=None, linked_event_id=None):
+     return create_event(cur, org_id, operator_id, "FARM_UPDATE", note, visibility, lat, lon, payload_json, linked_event_id)
+ 
+ 
+ def create_silo_update_event(cur, org_id, operator_id, note, visibility=PRIVATE_VISIBILITY, lat=None, lon=None, payload_json=None, linked_event_id=None):
+     return create_event(cur, org_id, operator_id, "SILO_UPDATE", note, visibility, lat, lon, payload_json, linked_event_id)
+ 
+ 
+ def add_silo(user, org_id, name, lat, lon, capacity_tonnes, material_id):
+     require_org_editor(user, org_id)
+     con = get_con()
+     try:
+         cur = con.cursor()
+         cur.execute(
+             """
+             INSERT INTO silo(organization_id,name,lat,lon,capacity_tonnes,material_id)
+             VALUES(?,?,?,?,?,?)
+             """,
+             (org_id, name, lat, lon, capacity_tonnes, material_id),
+         )
+         silo_id = cur.lastrowid
+-        event_id = create_farm_update_event(
++        event_id = create_silo_update_event(
+             cur,
+             org_id,
+             int(user["user_id"]),
+             f"New silo '{name}' added with silo_id={silo_id} ({capacity_tonnes:.0f} t)",
++            lat=lat,
++            lon=lon,
++            payload_json=json.dumps({"action": "ADD_SILO", "silo_id": int(silo_id), "capacity_tonnes": float(capacity_tonnes)}),
+         )
+         con.commit()
+         return silo_id, event_id
+     except Exception:
+         con.rollback()
+         raise
+     finally:
+         con.close()
+ 
+ 
+ def update_farm_boundary(user, org_id, polygon_geojson, note):
+     require_org_editor(user, org_id)
+     con = get_con()
+     try:
+         cur = con.cursor()
+         cur.execute(
+             "UPDATE farm_detail SET polygon_geojson=? WHERE organization_id=?",
+             (polygon_geojson, org_id),
+         )
+         if cur.rowcount != 1:
+             raise ValueError("Farm detail row was not found.")
+         event_id = create_farm_update_event(cur, org_id, int(user["user_id"]), note)
+         con.commit()
+         return org_id, event_id
+     except Exception:
+@@ -115,78 +118,83 @@ def update_farm_size(user, org_id, size_ha):
+             cur,
+             org_id,
+             int(user["user_id"]),
+             f"Farm detail organization_id={org_id} size updated to {size_ha:.0f} ha",
+         )
+         con.commit()
+         return org_id, event_id
+     except Exception:
+         con.rollback()
+         raise
+     finally:
+         con.close()
+ 
+ 
+ def update_silo_capacity(user, org_id, silo_id, silo_name, capacity_tonnes):
+     require_org_editor(user, org_id)
+     con = get_con()
+     try:
+         cur = con.cursor()
+         cur.execute(
+             "UPDATE silo SET capacity_tonnes=? WHERE silo_id=? AND organization_id=?",
+             (capacity_tonnes, silo_id, org_id),
+         )
+         if cur.rowcount != 1:
+             raise ValueError("Silo row was not found.")
+-        event_id = create_farm_update_event(
++        silo = cur.execute("SELECT lat, lon FROM silo WHERE silo_id=?", (silo_id,)).fetchone()
++        event_id = create_silo_update_event(
+             cur,
+             org_id,
+             int(user["user_id"]),
+             f"Silo '{silo_name}' silo_id={silo_id} capacity updated to {capacity_tonnes:.0f} t",
++            lat=silo[0] if silo else None,
++            lon=silo[1] if silo else None,
++            payload_json=json.dumps({"action": "UPDATE_SILO", "silo_id": int(silo_id), "capacity_tonnes": float(capacity_tonnes)}),
+         )
+         con.commit()
+         return silo_id, event_id
+     except Exception:
+         con.rollback()
+         raise
+     finally:
+         con.close()
+ 
+ 
+ def remove_silo(user, org_id, silo_id, silo_name):
+     require_org_editor(user, org_id)
+     con = get_con()
+     try:
+         cur = con.cursor()
+         cur.execute("DELETE FROM silo WHERE silo_id=? AND organization_id=?", (silo_id, org_id))
+         if cur.rowcount != 1:
+             raise ValueError("Silo row was not found.")
+-        event_id = create_farm_update_event(
++        event_id = create_silo_update_event(
+             cur,
+             org_id,
+             int(user["user_id"]),
+             f"Silo '{silo_name}' silo_id={silo_id} removed",
++            payload_json=json.dumps({"action": "REMOVE_SILO", "silo_id": int(silo_id)}),
+         )
+         con.commit()
+         return silo_id, event_id
+     except Exception:
+         con.rollback()
+         raise
+     finally:
+         con.close()
+ 
+ 
+ def assign_measurement_to_farm(user, org_id, measurement_event_id, visibility=PRIVATE_VISIBILITY):
+     """Attach a floating MEASUREMENT block to this farm as a FARM_UPDATE event."""
+     require_org_editor(user, org_id)
+     con = get_con()
+     try:
+         cur = con.cursor()
+         measurement = cur.execute(
+             """
+             SELECT e.event_id, e.organization_id, et.code
+             FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id
+             WHERE e.event_id=?
+             """,
+             (measurement_event_id,),
+         ).fetchone()
+         if not measurement or measurement[1] != int(org_id) or measurement[2] != "MEASUREMENT":
+@@ -246,25 +254,173 @@ def store_farm_update_in_silo(user, org_id, farm_update_event_id, silo_id, amoun
+         amount = float(amount_added_tonnes)
+         if amount <= 0:
+             raise ValueError("Amount added must be positive.")
+         event_id = create_silo_update_event(
+             cur,
+             org_id,
+             int(user["user_id"]),
+             f"Stored measured sample from FARM_UPDATE event_id={farm_update_event_id} in silo_id={silo_id}; amount_added_tonnes={amount:.2f}",
+             visibility=visibility,
+             lat=silo[2],
+             lon=silo[3],
+             payload_json=f'{{"source_farm_update_event_id":{int(farm_update_event_id)},"silo_id":{int(silo_id)},"amount_added_tonnes":{amount}}}',
+             linked_event_id=farm_update_event_id,
+         )
+         cur.execute(
+             "INSERT INTO silo_update_detail(silo_update_event_id,source_farm_update_event_id,silo_id,amount_added_tonnes,inventory_after_tonnes) VALUES(?,?,?,?,?)",
+             (event_id, farm_update_event_id, silo_id, amount, amount),
+         )
+         con.commit()
+         return event_id
+     except Exception:
+         con.rollback()
+         raise
+     finally:
+         con.close()
++
++
++def create_measurement_block(user, org_id, material_id, analyte_values, visibility=PRIVATE_VISIBILITY, sample_ref=None, lat=None, lon=None):
++    """Create a manual MEASUREMENT event block with result rows for user-entered properties."""
++    require_org_editor(user, org_id)
++    clean_results = {
++        str(analyte): float(value)
++        for analyte, value in analyte_values.items()
++        if value is not None
++    }
++    if not clean_results:
++        raise ValueError("At least one measured property is required.")
++    con = get_con()
++    try:
++        cur = con.cursor()
++        if lat is None or lon is None:
++            farm = cur.execute("SELECT lat, lon FROM farm_detail WHERE organization_id=?", (org_id,)).fetchone()
++            if farm:
++                lat = farm[0] if lat is None else lat
++                lon = farm[1] if lon is None else lon
++        ref = sample_ref or f"manual-{org_id}-{datetime.datetime.now(datetime.UTC).timestamp()}"
++        cur.execute(
++            "INSERT INTO sample(material_id,external_ref,batch_lot,collected_by_user_id) VALUES(?,?,?,?)",
++            (material_id, ref, ref, int(user["user_id"])),
++        )
++        sample_id = cur.lastrowid
++        payload = json.dumps({"action": "MANUAL_MEASUREMENT", "sample_id": sample_id})
++        event_id = create_event(
++            cur,
++            org_id,
++            int(user["user_id"]),
++            "MEASUREMENT",
++            f"Manual measurement recorded for sample_ref={ref}",
++            visibility=visibility,
++            lat=lat,
++            lon=lon,
++            payload_json=payload,
++        )
++        cur.execute(
++            "UPDATE event SET sample_id=?, location_text=? WHERE event_id=?",
++            (sample_id, "Manual measurement", event_id),
++        )
++        for analyte, value in clean_results.items():
++            cur.execute(
++                "INSERT INTO result(event_id,analyte,value,unit) VALUES(?,?,?,?)",
++                (event_id, analyte, value, "%"),
++            )
++        con.commit()
++        return event_id
++    except Exception:
++        con.rollback()
++        raise
++    finally:
++        con.close()
++
++
++def place_order(user, source_event_id, amount_tonnes, visibility=PRIVATE_VISIBILITY):
++    """Create an ORDER block linked to a readable farm/silo source block."""
++    if visibility not in VALID_EVENT_VISIBILITY:
++        raise ValueError("Invalid event visibility.")
++    amount = float(amount_tonnes)
++    if amount <= 0:
++        raise ValueError("Order amount must be positive.")
++    org_id = int(user["organization_id"])
++    con = get_con()
++    try:
++        cur = con.cursor()
++        source = cur.execute(
++            """
++            SELECT e.event_id, e.organization_id, et.code, e.visibility, e.lat, e.lon
++            FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id
++            WHERE e.event_id=?
++            """,
++            (source_event_id,),
++        ).fetchone()
++        if not source or source[3] not in ("PUBLIC", "SHARED") or source[2] not in ("SILO_UPDATE", "FARM_UPDATE"):
++            raise ValueError("Orders can only be placed against readable FARM_UPDATE or SILO_UPDATE blocks.")
++        if int(source[1]) == org_id:
++            raise ValueError("Cannot place an order against your own source block.")
++        event_id = create_event(
++            cur,
++            org_id,
++            int(user["user_id"]),
++            "ORDER",
++            f"Order requested from {source[2]} event_id={int(source_event_id)}; amount_tonnes={amount:.2f}",
++            visibility=visibility,
++            lat=source[4],
++            lon=source[5],
++            payload_json=json.dumps({"source_event_id": int(source_event_id), "seller_org_id": int(source[1]), "amount_tonnes": amount}),
++            linked_event_id=source_event_id,
++        )
++        cur.execute(
++            "INSERT INTO order_detail(order_event_id,source_event_id,seller_org_id,amount_tonnes,status) VALUES(?,?,?,?,?)",
++            (event_id, source_event_id, int(source[1]), amount, "REQUESTED"),
++        )
++        con.commit()
++        return event_id
++    except Exception:
++        con.rollback()
++        raise
++    finally:
++        con.close()
++
++
++def take_delivery(user, order_event_id, visibility="PUBLIC"):
++    """Create a DELIVERY block linked to a readable ORDER block."""
++    if visibility not in VALID_EVENT_VISIBILITY:
++        raise ValueError("Invalid event visibility.")
++    org_id = int(user["organization_id"])
++    con = get_con()
++    try:
++        cur = con.cursor()
++        order = cur.execute(
++            """
++            SELECT e.event_id, e.visibility, od.source_event_id, od.amount_tonnes, src.lat, src.lon
++            FROM order_detail od
++            JOIN event e ON e.event_id=od.order_event_id
++            JOIN event src ON src.event_id=od.source_event_id
++            LEFT JOIN delivery_detail dd ON dd.order_event_id=od.order_event_id
++            WHERE od.order_event_id=? AND dd.order_event_id IS NULL
++            """,
++            (order_event_id,),
++        ).fetchone()
++        if not order or order[1] not in ("PUBLIC", "SHARED"):
++            raise ValueError("Delivery can only be created for a readable undelivered ORDER block.")
++        event_id = create_event(
++            cur,
++            org_id,
++            int(user["user_id"]),
++            "DELIVERY",
++            f"Delivery accepted for ORDER event_id={int(order_event_id)}; source_event_id={int(order[2])}",
++            visibility=visibility,
++            lat=order[4],
++            lon=order[5],
++            payload_json=json.dumps({"order_event_id": int(order_event_id), "source_event_id": int(order[2]), "status": "IN_TRANSIT"}),
++            linked_event_id=order_event_id,
++        )
++        cur.execute(
++            "INSERT INTO delivery_detail(delivery_event_id,order_event_id,source_event_id,carrier_org_id,status) VALUES(?,?,?,?,?)",
++            (event_id, order_event_id, int(order[2]), org_id, "IN_TRANSIT"),
++        )
++        con.commit()
++        return event_id
++    except Exception:
++        con.rollback()
++        raise
++    finally:
++        con.close()
+diff --git a/app/views/event_map.py b/app/views/event_map.py
+index d125a5f8fd1490442e7d34f82116346e006966cb..f6dbc50eb325ec2c2b132007e9387ad0edf9bb8c 100644
+--- a/app/views/event_map.py
++++ b/app/views/event_map.py
+@@ -1,147 +1,186 @@
+ """Global event-block map for public/shared blocks and the user's private blocks."""
+ import html
+ import os, sys
+ 
+ import folium
+ import pandas as pd
+ import streamlit as st
+ from streamlit_folium import st_folium
+ 
+ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+-from db import get_event_blocks_for_map, get_measurement_results_for_events
++from db import get_deliverable_orders, get_event_blocks_for_map, get_measurement_results_for_events, get_orderable_blocks
++from services.farm_service import place_order, take_delivery
+ 
+ EVENT_COLOR = {
+     "MEASUREMENT": "blue",
+     "FARM_UPDATE": "green",
+     "SILO_UPDATE": "orange",
+     "ORDER": "red",
+     "DELIVERY": "purple",
+     "SOFT_DATA": "gray",
+     "METHOD_UPDATE": "cadetblue",
+     "CALIBRATION_UPDATE": "darkblue",
+     "INSTRUMENT_UPDATE": "black",
+ }
+ 
+ DEFECT_FIELDS = {"Percentage of Good", "Broken Percentage", "Damaged Percentage", "Foreign Matter Percentage"}
+ 
+ 
+ def _query_focus_event_id():
+     raw = st.query_params.get("focus_event_id")
+     if isinstance(raw, list):
+         raw = raw[0] if raw else None
+     try:
+         return int(raw) if raw else None
+     except (TypeError, ValueError):
+         return None
+ 
+ 
+ def _set_focus_event(event_id):
+     st.session_state["focused_event_id"] = int(event_id)
+     st.query_params["focus_event_id"] = str(int(event_id))
+ 
+ 
+ def _parse_id_csv(value):
+     if pd.isna(value) or value in (None, ""):
+         return []
+     return [int(part) for part in str(value).split(",") if part.strip().isdigit()]
+ 
+ 
+ def _related_event_ids(row):
+     related = _parse_id_csv(row.get("linked_event_ids"))
+     previous = row.get("previous_event_id")
+     if pd.notna(previous):
+         related.append(int(previous))
+     return list(dict.fromkeys(related))
+ 
+ 
+ def _result_cell(label, value, defect=False):
+     safe_label = html.escape(label)
+-    safe_value = html.escape(value or "Not measured")
++    safe_value = html.escape(value or "—")
+     border = "#f59e0b" if defect else "#d1d5db"
+     background = "#fff7ed" if defect else "#f9fafb"
+     return (
+         f"<div style='border:1px solid {border};border-radius:8px;padding:6px 8px;background:{background};margin:3px 0'>"
+         f"<span style='color:#6b7280;font-size:11px'>{safe_label}</span><br>"
+         f"<b>{safe_value}</b></div>"
+     )
+ 
+ 
+ def _measurement_results_html(measurements):
+     if not measurements:
+         return "<div style='color:#6b7280'>No measurement results attached to this block.</div>"
+     sections = []
+     for measurement in measurements:
+         chemical = "".join(_result_cell(label, value) for label, value in measurement["chemical"].items())
+         classification = "".join(_result_cell(label, value) for label, value in measurement["classification"].items())
+         defects = "".join(_result_cell(label, value, label in DEFECT_FIELDS) for label, value in measurement["defects"].items())
+         sections.append(
+             f"""
+             <div style='border:1px solid #e5e7eb;border-radius:10px;padding:8px;margin-top:6px;background:#ffffff'>
+               <b>Results from MEASUREMENT #{measurement['measurement_event_id']}</b><br>
+               <span style='color:#6b7280;font-size:11px'>{html.escape(str(measurement.get('timestamp') or '')[:19])}</span>
+               <div style='margin-top:6px'><b>Chemical properties</b>{chemical}</div>
+               <div style='margin-top:6px'><b>Classification</b>{classification}</div>
+               <div style='margin-top:6px'><b>Defect percentages</b>{defects}</div>
+             </div>
+             """
+         )
+     return "".join(sections)
+ 
+ 
+ def _links_html(related_ids):
+     if not related_ids:
+         return ""
+     links = " ".join(
+-        f"<a href='?focus_event_id={event_id}' target='_self' "
++        f"<a href='?focus_event_id={event_id}' target='_top' "
+         "style='display:inline-block;margin:2px;padding:4px 7px;border-radius:999px;background:#eef2ff;color:#3730a3;text-decoration:none'>"
+         f"Event #{event_id}</a>"
+         for event_id in related_ids
+     )
+     return f"<hr style='margin:6px 0'><b>Related event references</b><br>{links}"
+ 
+ 
+ def _render_results_cards(measurements):
+     if not measurements:
+         st.info("No measurement results are linked to this block yet. Older events remain readable with missing-field fallbacks.")
+         return
+     for measurement in measurements:
+         st.markdown(f"**Results from MEASUREMENT #{measurement['measurement_event_id']}**")
+         chem_cols = st.columns(5)
+         for idx, (label, value) in enumerate(measurement["chemical"].items()):
+-            chem_cols[idx % 5].metric(label, value or "Not measured")
++            chem_cols[idx % 5].metric(label, value or "—")
+         st.caption("Classification information")
+         st.dataframe(pd.DataFrame([measurement["classification"]]), hide_index=True, use_container_width=True)
+         st.caption("Defect percentages")
+         st.dataframe(pd.DataFrame([measurement["defects"]]), hide_index=True, use_container_width=True)
+ 
+ 
+ def render():
+     user = st.session_state["user"]
+     st.title("🌍 Supply-chain Event Blocks")
+     st.caption("Public/shared blocks from every organisation are visible. Private blocks are shown only when they belong to your organisation.")
+ 
++    with st.expander("➕ Generate ORDER or DELIVERY blocks from interactions", expanded=False):
++        orderable = get_orderable_blocks(user)
++        c_order, c_delivery = st.columns(2)
++        with c_order:
++            st.markdown("**Place order**")
++            if orderable.empty:
++                st.info("No public/shared farm or silo source blocks from other organisations are available to order.")
++            else:
++                source_labels = {
++                    f"#{int(row['event_id'])} · {row['event_type']} · {row['seller']} · {str(row['local_timestamp'])[:19]} · {row.get('note') or ''}": int(row["event_id"])
++                    for _, row in orderable.iterrows()
++                }
++                selected_source = st.selectbox("Source block", list(source_labels.keys()))
++                order_amount = st.number_input("Order amount (t)", min_value=0.01, value=10.0, step=1.0)
++                order_visibility = st.selectbox("Order visibility", ["PRIVATE", "SHARED", "PUBLIC"], index=1)
++                if st.button("🧾 Generate ORDER block"):
++                    event_id = place_order(user, source_labels[selected_source], order_amount, order_visibility)
++                    _set_focus_event(event_id)
++                    st.success(f"ORDER event {event_id} created and linked to source block {source_labels[selected_source]}.")
++                    st.rerun()
++        with c_delivery:
++            st.markdown("**Take delivery**")
++            deliverable = get_deliverable_orders(user)
++            if deliverable.empty:
++                st.info("No readable undelivered order blocks are available.")
++            else:
++                order_labels = {
++                    f"#{int(row['order_event_id'])} · {row['buyer']} ← {row['seller']} · {float(row['amount_tonnes']):.2f} t · {str(row['local_timestamp'])[:19]}": int(row["order_event_id"])
++                    for _, row in deliverable.iterrows()
++                }
++                selected_order = st.selectbox("Order block", list(order_labels.keys()))
++                delivery_visibility = st.selectbox("Delivery visibility", ["PUBLIC", "SHARED", "PRIVATE"], key="delivery_visibility")
++                if st.button("🚚 Generate DELIVERY block"):
++                    event_id = take_delivery(user, order_labels[selected_order], delivery_visibility)
++                    _set_focus_event(event_id)
++                    st.success(f"DELIVERY event {event_id} created for ORDER {order_labels[selected_order]}.")
++                    st.rerun()
++
+     blocks = get_event_blocks_for_map(user)
+     if blocks.empty:
+         st.info("No event blocks found.")
+         return
+ 
+     focused_event_id = st.session_state.get("focused_event_id") or _query_focus_event_id()
+     if focused_event_id not in set(blocks["event_id"].astype(int).tolist()):
+         focused_event_id = None
+ 
+     event_types = sorted(blocks["event_type"].dropna().unique().tolist())
+     selected = st.multiselect("Event types", event_types, default=event_types)
+     visibilities = sorted(blocks["visibility"].dropna().unique().tolist())
+     selected_vis = st.multiselect("Visibility", visibilities, default=visibilities)
+     filtered = blocks[blocks["event_type"].isin(selected) & blocks["visibility"].isin(selected_vis)].copy()
+     if focused_event_id and focused_event_id not in set(filtered["event_id"].astype(int).tolist()):
+         focused = blocks[blocks["event_id"].astype(int) == focused_event_id]
+         filtered = pd.concat([focused, filtered], ignore_index=True).drop_duplicates("event_id")
+ 
+     map_ready = filtered.dropna(subset=["lat", "lon"]).copy()
+     missing_coords = len(filtered) - len(map_ready)
+     public_total = int((blocks["visibility"] == "PUBLIC").sum())
+     public_map_ready = int((map_ready["visibility"] == "PUBLIC").sum())
+ 
+     c1, c2, c3, c4 = st.columns(4)
+     c1.metric("Blocks rendered", len(map_ready))
+diff --git a/app/views/events.py b/app/views/events.py
+index 764b1a1e84005b84ccda746bdc19be30c944e5b1..d72755ca64dc31cfd89609dc46cf01a28495cbb1 100644
+--- a/app/views/events.py
++++ b/app/views/events.py
+@@ -37,54 +37,60 @@ def render():
+             value=(df["local_timestamp"].min().date(), df["local_timestamp"].max().date()))
+ 
+     filtered = df.copy()
+     if type_filter != "All":
+         filtered = filtered[filtered["event_type"] == type_filter]
+     if vis_filter != "All":
+         filtered = filtered[filtered["visibility"] == vis_filter]
+     if len(date_range) == 2:
+         start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+         filtered = filtered[(filtered["local_timestamp"] >= start) &
+                             (filtered["local_timestamp"] <= end)]
+ 
+     st.markdown(f"**{len(filtered)} events** matching filters (out of {len(df)} total)")
+ 
+     # ── Timeline chart ────────────────────────────────────────
+     if not filtered.empty:
+         timeline = filtered.groupby([filtered["local_timestamp"].dt.date, "event_type"]).size().reset_index()
+         timeline.columns = ["date", "event_type", "count"]
+         fig = px.bar(timeline, x="date", y="count", color="event_type",
+                      title="Events over time", labels={"date": "Date", "count": "Count"})
+         fig.update_layout(height=280, margin=dict(t=40, b=10))
+         st.plotly_chart(fig, use_container_width=True)
+ 
+     # ── Table ────────────────────────────────────────────────
+     st.dataframe(
+-        filtered[["event_id","event_type","operator","role","instrument","local_timestamp","visibility","location_text"]]
++        filtered[["event_id","event_type","operator","role","instrument","local_timestamp","visibility","location_text","soft_data","results","linked_event_ids","amount_added_tonnes","order_amount_tonnes","delivery_status"]]
+         .rename(columns={
+             "event_id":       "ID",
+             "event_type":     "Type",
+             "operator":       "Operator",
+             "role":           "Role",
+             "instrument":     "Instrument",
+             "local_timestamp":"Timestamp",
+             "visibility":     "Visibility",
+             "location_text":  "Location",
++            "soft_data":      "Soft data / block note",
++            "results":        "Results",
++            "linked_event_ids":"Referenced event blocks",
++            "amount_added_tonnes":"Stored (t)",
++            "order_amount_tonnes":"Ordered (t)",
++            "delivery_status":"Delivery",
+         })
+         .reset_index(drop=True),
+         use_container_width=True,
+         height=420,
+     )
+ 
+     # ── Chain explorer ────────────────────────────────────────
+     st.markdown("---")
+     st.subheader("🔗 Event chain explorer")
+     st.caption("Walk backward through previous_event_id within your read permissions.")
+     event_ids = filtered["event_id"].tolist()
+     chosen_id = st.selectbox("Pick an event ID to trace", event_ids[:50])
+ 
+     if chosen_id:
+         chain_df = get_event_chain(chosen_id, user)
+         if not chain_df.empty:
+             st.dataframe(chain_df, use_container_width=True)
+         else:
+             st.info("No chain found.")
+diff --git a/app/views/map_view.py b/app/views/map_view.py
+index 0f022066d69b4f6ee3ac50e210fa2edf71df39a3..4b7cd16373dfe03d738b85ec119e5485002a8376 100644
+--- a/app/views/map_view.py
++++ b/app/views/map_view.py
+@@ -1,37 +1,37 @@
+ """
+ map_view.py — Interactive farm map with polygon drawing + silo management.
+ """
+ import streamlit as st
+ import folium
+ from streamlit_folium import st_folium
+ import pandas as pd
+ import json, sys, os
+ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ from access_control import can_edit_org
+ from db import get_silos, get_org_materials, get_last_measurement, get_con, get_floating_measurements, get_assignable_farm_updates
+-from services.farm_service import add_silo, assign_measurement_to_farm, remove_silo, store_farm_update_in_silo, update_farm_boundary, update_farm_size, update_silo_capacity
++from services.farm_service import add_silo, assign_measurement_to_farm, create_measurement_block, remove_silo, store_farm_update_in_silo, update_farm_boundary, update_farm_size, update_silo_capacity
+ 
+ ORG_TYPE_COLOR = {
+     "FARMER": "#4CAF50", "MILLER": "#FF9800", "LAB": "#2196F3",
+     "ZEUTEC": "#9C27B0", "TRADER": "#F44336", "BUYER": "#00BCD4",
+     "LOGISTICS": "#795548",
+ }
+ 
+ def render():
+     org    = st.session_state["org"]
+     user   = st.session_state["user"]
+     org_id = int(org["organization_id"])
+     can_edit = can_edit_org(user, org_id)
+ 
+     st.title(f"🗺️ Farm Map — {org['name']}")
+     st.caption(f"{org['org_type']}  ·  {org.get('country','')}")
+ 
+     # Check if this org has farm data
+     has_farm = pd.notna(org.get("lat")) and pd.notna(org.get("lon"))
+ 
+     if not has_farm:
+         if can_edit:
+             st.warning(f"No farm location data for **{org['org_type']}** organisations. "
+                        "Farm details are only available for FARMER, MILLER, LAB and ZEUTEC organisations.")
+         else:
+             st.warning("No farm location data is registered for this organisation.")
+@@ -117,67 +117,102 @@ def render():
+     if can_edit:
+         st.

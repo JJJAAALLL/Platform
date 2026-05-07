@@ -8,7 +8,8 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from db import get_event_blocks_for_map, get_measurement_results_for_events
+from db import get_deliverable_orders, get_event_blocks_for_map, get_measurement_results_for_events, get_orderable_blocks
+from services.farm_service import place_order, take_delivery
 
 EVENT_COLOR = {
     "MEASUREMENT": "blue",
@@ -56,7 +57,7 @@ def _related_event_ids(row):
 
 def _result_cell(label, value, defect=False):
     safe_label = html.escape(label)
-    safe_value = html.escape(value or "Not measured")
+    safe_value = html.escape(value or "—")
     border = "#f59e0b" if defect else "#d1d5db"
     background = "#fff7ed" if defect else "#f9fafb"
     return (
@@ -92,7 +93,7 @@ def _links_html(related_ids):
     if not related_ids:
         return ""
     links = " ".join(
-        f"<a href='?focus_event_id={event_id}' target='_self' "
+        f"<a href='?focus_event_id={event_id}' target='_top' "
         "style='display:inline-block;margin:2px;padding:4px 7px;border-radius:999px;background:#eef2ff;color:#3730a3;text-decoration:none'>"
         f"Event #{event_id}</a>"
         for event_id in related_ids
@@ -108,7 +109,7 @@ def _render_results_cards(measurements):
         st.markdown(f"**Results from MEASUREMENT #{measurement['measurement_event_id']}**")
         chem_cols = st.columns(5)
         for idx, (label, value) in enumerate(measurement["chemical"].items()):
-            chem_cols[idx % 5].metric(label, value or "Not measured")
+            chem_cols[idx % 5].metric(label, value or "—")
         st.caption("Classification information")
         st.dataframe(pd.DataFrame([measurement["classification"]]), hide_index=True, use_container_width=True)
         st.caption("Defect percentages")
@@ -119,6 +120,44 @@ def render():
     user = st.session_state["user"]
     st.title("🌍 Supply-chain Event Blocks")
     st.caption("Public/shared blocks from every organisation are visible. Private blocks are shown only when they belong to your organisation.")
+
+    with st.expander("➕ Generate ORDER or DELIVERY blocks from interactions", expanded=False):
+        orderable = get_orderable_blocks(user)
+        c_order, c_delivery = st.columns(2)
+        with c_order:
+            st.markdown("**Place order**")
+            if orderable.empty:
+                st.info("No public/shared farm or silo source blocks from other organisations are available to order.")
+            else:
+                source_labels = {
+                    f"#{int(row['event_id'])} · {row['event_type']} · {row['seller']} · {str(row['local_timestamp'])[:19]} · {row.get('note') or ''}": int(row["event_id"])
+                    for _, row in orderable.iterrows()
+                }
+                selected_source = st.selectbox("Source block", list(source_labels.keys()))
+                order_amount = st.number_input("Order amount (t)", min_value=0.01, value=10.0, step=1.0)
+                order_visibility = st.selectbox("Order visibility", ["PRIVATE", "SHARED", "PUBLIC"], index=1)
+                if st.button("🧾 Generate ORDER block"):
+                    event_id = place_order(user, source_labels[selected_source], order_amount, order_visibility)
+                    _set_focus_event(event_id)
+                    st.success(f"ORDER event {event_id} created and linked to source block {source_labels[selected_source]}.")
+                    st.rerun()
+        with c_delivery:
+            st.markdown("**Take delivery**")
+            deliverable = get_deliverable_orders(user)
+            if deliverable.empty:
+                st.info("No readable undelivered order blocks are available.")
+            else:
+                order_labels = {
+                    f"#{int(row['order_event_id'])} · {row['buyer']} ← {row['seller']} · {float(row['amount_tonnes']):.2f} t · {str(row['local_timestamp'])[:19]}": int(row["order_event_id"])
+                    for _, row in deliverable.iterrows()
+                }
+                selected_order = st.selectbox("Order block", list(order_labels.keys()))
+                delivery_visibility = st.selectbox("Delivery visibility", ["PUBLIC", "SHARED", "PRIVATE"], key="delivery_visibility")
+                if st.button("🚚 Generate DELIVERY block"):
+                    event_id = take_delivery(user, order_labels[selected_order], delivery_visibility)
+                    _set_focus_event(event_id)
+                    st.success(f"DELIVERY event {event_id} created for ORDER {order_labels[selected_order]}.")
+                    st.rerun()
 
     blocks = get_event_blocks_for_map(user)
     if blocks.empty:

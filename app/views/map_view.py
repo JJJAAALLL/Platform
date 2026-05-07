@@ -9,7 +9,7 @@ import json, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from access_control import can_edit_org
 from db import get_silos, get_org_materials, get_last_measurement, get_con, get_floating_measurements, get_assignable_farm_updates
-from services.farm_service import add_silo, assign_measurement_to_farm, remove_silo, store_farm_update_in_silo, update_farm_boundary, update_farm_size, update_silo_capacity
+from services.farm_service import add_silo, assign_measurement_to_farm, create_measurement_block, remove_silo, store_farm_update_in_silo, update_farm_boundary, update_farm_size, update_silo_capacity
 
 ORG_TYPE_COLOR = {
     "FARMER": "#4CAF50", "MILLER": "#FF9800", "LAB": "#2196F3",
@@ -139,7 +139,7 @@ def render():
             note = st.text_input("Change note", value="Farm boundary updated via dashboard")
             if st.button("💾 Save boundary", type="primary"):
                 record_id, event_id = update_farm_boundary(user, org_id, new_poly, note)
-                st.success(f"Farm detail {record_id} boundary saved; FARM_UPDATE event {event_id} logged.")
+                st.success(f"Farm detail {record_id} boundary saved; SILO_UPDATE event {event_id} logged.")
                 st.rerun()
         else:
             st.info("Draw a rectangle or polygon on the map above, then save it here.")
@@ -156,6 +156,41 @@ def render():
 
     with col_silos:
 
+        st.subheader("🧪 Record measurement block")
+        st.caption("Enter only measured properties. Saving creates a MEASUREMENT event block immediately, then it can be assigned to the farm below.")
+        con = get_con()
+        material_rows = con.execute("SELECT material_id, name FROM material ORDER BY name").fetchall()
+        con.close()
+        material_options = {row["name"]: row["material_id"] for row in material_rows}
+        with st.form("manual_measurement"):
+            mm_ref = st.text_input("Sample reference", placeholder="e.g. Field-A-2026-05")
+            mm_material = st.selectbox("Material", list(material_options.keys()), key="measurement_material")
+            c_m1, c_m2, c_m3 = st.columns(3)
+            protein = c_m1.number_input("Protein %", min_value=0.0, max_value=100.0, value=None, step=0.1)
+            moisture = c_m2.number_input("Moisture %", min_value=0.0, max_value=100.0, value=None, step=0.1)
+            ash = c_m3.number_input("Ash %", min_value=0.0, max_value=100.0, value=None, step=0.1)
+            c_m4, c_m5, c_m6 = st.columns(3)
+            gluten = c_m4.number_input("Gluten %", min_value=0.0, max_value=100.0, value=None, step=0.1)
+            good = c_m5.number_input("Percentage of Good %", min_value=0.0, max_value=100.0, value=None, step=0.1)
+            broken = c_m6.number_input("Broken Percentage %", min_value=0.0, max_value=100.0, value=None, step=0.1)
+            measurement_visibility = st.selectbox("Measurement visibility", ["PRIVATE", "SHARED", "PUBLIC"], key="measurement_visibility")
+            save_measurement = st.form_submit_button("🔬 Save MEASUREMENT block")
+        if save_measurement:
+            values = {
+                "Protein": protein,
+                "Moisture": moisture,
+                "Ash": ash,
+                "Gluten": gluten,
+                "Percentage of Good": good,
+                "Broken Percentage": broken,
+            }
+            event_id = create_measurement_block(
+                user, org_id, material_options[mm_material], values, measurement_visibility, mm_ref or None, lat, lon
+            )
+            st.success(f"MEASUREMENT event {event_id} created. Assign it to the farm to generate the FARM_UPDATE block.")
+            st.rerun()
+
+        st.markdown("---")
         st.subheader("🧪 Floating measurement blocks")
         st.caption("Measurements start as independent event blocks. Assign one to your farm to create a FARM_UPDATE event with measurement history attached.")
         floating = get_floating_measurements(org_id, user)
@@ -211,13 +246,13 @@ def render():
                         silo_id, event_id = update_silo_capacity(
                             user, org_id, int(silo["silo_id"]), silo["name"], new_cap
                         )
-                        st.success(f"Silo {silo_id} saved; FARM_UPDATE event {event_id} logged.")
+                        st.success(f"Silo {silo_id} saved; SILO_UPDATE event {event_id} logged.")
                         st.rerun()
                     if c2.button("🗑️ Remove", key=f"del_{silo['silo_id']}"):
                         silo_id, event_id = remove_silo(
                             user, org_id, int(silo["silo_id"]), silo["name"]
                         )
-                        st.warning(f"Silo {silo_id} removed; FARM_UPDATE event {event_id} logged.")
+                        st.warning(f"Silo {silo_id} removed; SILO_UPDATE event {event_id} logged.")
                         st.rerun()
 
         st.markdown("---")
@@ -239,5 +274,5 @@ def render():
             silo_id, event_id = add_silo(
                 user, org_id, silo_name, s_lat, s_lon, s_cap, mat_opts[s_mat]
             )
-            st.success(f"Silo '{silo_name}' added with ID {silo_id}; FARM_UPDATE event {event_id} logged.")
+            st.success(f"Silo '{silo_name}' added with ID {silo_id}; SILO_UPDATE event {event_id} logged.")
             st.rerun()

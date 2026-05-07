@@ -1,5 +1,5 @@
 """Transactional farm, measurement-assignment, and silo mutations with ledger events."""
-import datetime
+import datetime, json
 
 from access_control import can_edit_org
 from config import PRIVATE_VISIBILITY, VALID_EVENT_VISIBILITY
@@ -67,11 +67,14 @@ def add_silo(user, org_id, name, lat, lon, capacity_tonnes, material_id):
             (org_id, name, lat, lon, capacity_tonnes, material_id),
         )
         silo_id = cur.lastrowid
-        event_id = create_farm_update_event(
+        event_id = create_silo_update_event(
             cur,
             org_id,
             int(user["user_id"]),
             f"New silo '{name}' added with silo_id={silo_id} ({capacity_tonnes:.0f} t)",
+            lat=lat,
+            lon=lon,
+            payload_json=json.dumps({"action": "ADD_SILO", "silo_id": int(silo_id), "capacity_tonnes": float(capacity_tonnes)}),
         )
         con.commit()
         return silo_id, event_id
@@ -137,11 +140,15 @@ def update_silo_capacity(user, org_id, silo_id, silo_name, capacity_tonnes):
         )
         if cur.rowcount != 1:
             raise ValueError("Silo row was not found.")
-        event_id = create_farm_update_event(
+        silo = cur.execute("SELECT lat, lon FROM silo WHERE silo_id=?", (silo_id,)).fetchone()
+        event_id = create_silo_update_event(
             cur,
             org_id,
             int(user["user_id"]),
             f"Silo '{silo_name}' silo_id={silo_id} capacity updated to {capacity_tonnes:.0f} t",
+            lat=silo[0] if silo else None,
+            lon=silo[1] if silo else None,
+            payload_json=json.dumps({"action": "UPDATE_SILO", "silo_id": int(silo_id), "capacity_tonnes": float(capacity_tonnes)}),
         )
         con.commit()
         return silo_id, event_id
@@ -160,11 +167,12 @@ def remove_silo(user, org_id, silo_id, silo_name):
         cur.execute("DELETE FROM silo WHERE silo_id=? AND organization_id=?", (silo_id, org_id))
         if cur.rowcount != 1:
             raise ValueError("Silo row was not found.")
-        event_id = create_farm_update_event(
+        event_id = create_silo_update_event(
             cur,
             org_id,
             int(user["user_id"]),
             f"Silo '{silo_name}' silo_id={silo_id} removed",
+            payload_json=json.dumps({"action": "REMOVE_SILO", "silo_id": int(silo_id)}),
         )
         con.commit()
         return silo_id, event_id
@@ -260,6 +268,154 @@ def store_farm_update_in_silo(user, org_id, farm_update_event_id, silo_id, amoun
         cur.execute(
             "INSERT INTO silo_update_detail(silo_update_event_id,source_farm_update_event_id,silo_id,amount_added_tonnes,inventory_after_tonnes) VALUES(?,?,?,?,?)",
             (event_id, farm_update_event_id, silo_id, amount, amount),
+        )
+        con.commit()
+        return event_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def create_measurement_block(user, org_id, material_id, analyte_values, visibility=PRIVATE_VISIBILITY, sample_ref=None, lat=None, lon=None):
+    """Create a manual MEASUREMENT event block with result rows for user-entered properties."""
+    require_org_editor(user, org_id)
+    clean_results = {
+        str(analyte): float(value)
+        for analyte, value in analyte_values.items()
+        if value is not None
+    }
+    if not clean_results:
+        raise ValueError("At least one measured property is required.")
+    con = get_con()
+    try:
+        cur = con.cursor()
+        if lat is None or lon is None:
+            farm = cur.execute("SELECT lat, lon FROM farm_detail WHERE organization_id=?", (org_id,)).fetchone()
+            if farm:
+                lat = farm[0] if lat is None else lat
+                lon = farm[1] if lon is None else lon
+        ref = sample_ref or f"manual-{org_id}-{datetime.datetime.now(datetime.UTC).timestamp()}"
+        cur.execute(
+            "INSERT INTO sample(material_id,external_ref,batch_lot,collected_by_user_id) VALUES(?,?,?,?)",
+            (material_id, ref, ref, int(user["user_id"])),
+        )
+        sample_id = cur.lastrowid
+        payload = json.dumps({"action": "MANUAL_MEASUREMENT", "sample_id": sample_id})
+        event_id = create_event(
+            cur,
+            org_id,
+            int(user["user_id"]),
+            "MEASUREMENT",
+            f"Manual measurement recorded for sample_ref={ref}",
+            visibility=visibility,
+            lat=lat,
+            lon=lon,
+            payload_json=payload,
+        )
+        cur.execute(
+            "UPDATE event SET sample_id=?, location_text=? WHERE event_id=?",
+            (sample_id, "Manual measurement", event_id),
+        )
+        for analyte, value in clean_results.items():
+            cur.execute(
+                "INSERT INTO result(event_id,analyte,value,unit) VALUES(?,?,?,?)",
+                (event_id, analyte, value, "%"),
+            )
+        con.commit()
+        return event_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def place_order(user, source_event_id, amount_tonnes, visibility=PRIVATE_VISIBILITY):
+    """Create an ORDER block linked to a readable farm/silo source block."""
+    if visibility not in VALID_EVENT_VISIBILITY:
+        raise ValueError("Invalid event visibility.")
+    amount = float(amount_tonnes)
+    if amount <= 0:
+        raise ValueError("Order amount must be positive.")
+    org_id = int(user["organization_id"])
+    con = get_con()
+    try:
+        cur = con.cursor()
+        source = cur.execute(
+            """
+            SELECT e.event_id, e.organization_id, et.code, e.visibility, e.lat, e.lon
+            FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id
+            WHERE e.event_id=?
+            """,
+            (source_event_id,),
+        ).fetchone()
+        if not source or source[3] not in ("PUBLIC", "SHARED") or source[2] not in ("SILO_UPDATE", "FARM_UPDATE"):
+            raise ValueError("Orders can only be placed against readable FARM_UPDATE or SILO_UPDATE blocks.")
+        if int(source[1]) == org_id:
+            raise ValueError("Cannot place an order against your own source block.")
+        event_id = create_event(
+            cur,
+            org_id,
+            int(user["user_id"]),
+            "ORDER",
+            f"Order requested from {source[2]} event_id={int(source_event_id)}; amount_tonnes={amount:.2f}",
+            visibility=visibility,
+            lat=source[4],
+            lon=source[5],
+            payload_json=json.dumps({"source_event_id": int(source_event_id), "seller_org_id": int(source[1]), "amount_tonnes": amount}),
+            linked_event_id=source_event_id,
+        )
+        cur.execute(
+            "INSERT INTO order_detail(order_event_id,source_event_id,seller_org_id,amount_tonnes,status) VALUES(?,?,?,?,?)",
+            (event_id, source_event_id, int(source[1]), amount, "REQUESTED"),
+        )
+        con.commit()
+        return event_id
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def take_delivery(user, order_event_id, visibility="PUBLIC"):
+    """Create a DELIVERY block linked to a readable ORDER block."""
+    if visibility not in VALID_EVENT_VISIBILITY:
+        raise ValueError("Invalid event visibility.")
+    org_id = int(user["organization_id"])
+    con = get_con()
+    try:
+        cur = con.cursor()
+        order = cur.execute(
+            """
+            SELECT e.event_id, e.visibility, od.source_event_id, od.amount_tonnes, src.lat, src.lon
+            FROM order_detail od
+            JOIN event e ON e.event_id=od.order_event_id
+            JOIN event src ON src.event_id=od.source_event_id
+            LEFT JOIN delivery_detail dd ON dd.order_event_id=od.order_event_id
+            WHERE od.order_event_id=? AND dd.order_event_id IS NULL
+            """,
+            (order_event_id,),
+        ).fetchone()
+        if not order or order[1] not in ("PUBLIC", "SHARED"):
+            raise ValueError("Delivery can only be created for a readable undelivered ORDER block.")
+        event_id = create_event(
+            cur,
+            org_id,
+            int(user["user_id"]),
+            "DELIVERY",
+            f"Delivery accepted for ORDER event_id={int(order_event_id)}; source_event_id={int(order[2])}",
+            visibility=visibility,
+            lat=order[4],
+            lon=order[5],
+            payload_json=json.dumps({"order_event_id": int(order_event_id), "source_event_id": int(order[2]), "status": "IN_TRANSIT"}),
+            linked_event_id=order_event_id,
+        )
+        cur.execute(
+            "INSERT INTO delivery_detail(delivery_event_id,order_event_id,source_event_id,carrier_org_id,status) VALUES(?,?,?,?,?)",
+            (event_id, order_event_id, int(order[2]), org_id, "IN_TRANSIT"),
         )
         con.commit()
         return event_id

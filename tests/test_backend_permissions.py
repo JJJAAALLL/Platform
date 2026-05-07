@@ -8,13 +8,15 @@ sys.path.insert(0, str(ROOT / "app"))
 
 from access_control import can_edit_org
 from config import DB_PATH, DEMO_PASSWORD
-from db import authenticate_user, get_event_blocks_for_map, get_floating_measurements, get_login_users, get_measurement_results_for_events, get_organizations, get_silos
+from db import authenticate_user, get_deliverable_orders, get_event_blocks_for_map, get_floating_measurements, get_login_users, get_measurement_results_for_events, get_orderable_blocks, get_organizations, get_silos
 from services.farm_service import (
     PermissionDenied,
     add_silo,
     assign_measurement_to_farm,
     remove_silo,
     store_farm_update_in_silo,
+    place_order,
+    take_delivery,
     update_farm_size,
     update_silo_capacity,
 )
@@ -45,6 +47,9 @@ def cleanup_events(event_ids):
         con.execute("DELETE FROM silo_update_detail WHERE silo_update_event_id=?", (event_id,))
         con.execute("DELETE FROM farm_measurement_assignment WHERE farm_update_event_id=?", (event_id,))
         con.execute("DELETE FROM event_link WHERE event_id=? OR linked_event_id=?", (event_id, event_id))
+        con.execute("DELETE FROM result WHERE event_id=?", (event_id,))
+        con.execute("DELETE FROM measurement_image WHERE event_id=?", (event_id,))
+        con.execute("DELETE FROM measurement_data WHERE event_id=?", (event_id,))
         con.execute("DELETE FROM soft_data WHERE event_id=?", (event_id,))
     for event_id in reversed(event_ids):
         con.execute("DELETE FROM event WHERE event_id=?", (event_id,))
@@ -165,6 +170,21 @@ class BackendPermissionTests(unittest.TestCase):
             "SELECT COUNT(*) AS n FROM event WHERE visibility='PUBLIC'"
         )["n"]
         self.assertGreaterEqual(len(blocks[blocks["visibility"] == "PUBLIC"]), public_db_count)
+
+    def test_order_and_delivery_interactions_create_linked_blocks(self):
+        orderable = get_orderable_blocks(self.user)
+        if orderable.empty:
+            self.skipTest("Seeded database has no orderable public/shared source block.")
+        source_event_id = int(orderable.iloc[0]["event_id"])
+        order_id = place_order(self.user, source_event_id, 1.25, "PUBLIC")
+        delivery_options = get_deliverable_orders(self.user)
+        self.assertIn(order_id, set(delivery_options["order_event_id"].astype(int).tolist()))
+        delivery_id = take_delivery(self.user, order_id, "PUBLIC")
+        order_link = fetchone("SELECT linked_event_id FROM event_link WHERE event_id=?", (order_id,))
+        delivery_link = fetchone("SELECT linked_event_id FROM event_link WHERE event_id=?", (delivery_id,))
+        self.assertEqual(int(order_link["linked_event_id"]), source_event_id)
+        self.assertEqual(int(delivery_link["linked_event_id"]), order_id)
+        cleanup_events([order_id, delivery_id])
 
     def test_measurement_results_propagate_to_downstream_blocks(self):
         row = fetchone(
