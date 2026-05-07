@@ -1,0 +1,145 @@
+"""db.py - centralised database connection and access-control helpers."""
+import hashlib, hmac, sqlite3
+import pandas as pd
+
+from access_control import event_access_params
+from config import DB_PATH, PASSWORD_HASH_ITERATIONS, READABLE_EVENT_VISIBILITY
+
+def get_con():
+    con = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON;")
+    return con
+
+def get_df(sql, params=()):
+    con = get_con(); df = pd.read_sql_query(sql, con, params=params); con.close(); return df
+
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    ).hex()
+
+def get_login_users():
+    return get_df("""
+        SELECT u.username, u.full_name, u.role, o.name AS organization, o.org_type
+        FROM user_account u
+        JOIN organization o ON o.organization_id=u.organization_id
+        ORDER BY o.name, u.full_name
+    """)
+
+def authenticate_user(username, password):
+    con = get_con()
+    row = con.execute("""
+        SELECT u.user_id, u.organization_id, u.username, u.password_hash,
+               u.password_salt, u.full_name, u.role,
+               o.code AS org_code, o.name AS organization_name, o.org_type
+        FROM user_account u
+        JOIN organization o ON o.organization_id=u.organization_id
+        WHERE u.username=?
+    """, (username,)).fetchone()
+    con.close()
+    if not row:
+        return None
+    expected = hash_password(password, row["password_salt"])
+    if not hmac.compare_digest(expected, row["password_hash"]):
+        return None
+    user = dict(row)
+    user.pop("password_hash", None)
+    user.pop("password_salt", None)
+    return user
+
+def get_organizations(user):
+    return get_df("""
+        SELECT o.organization_id, o.code, o.name, o.org_type,
+            COUNT(DISTINCT u.user_id) AS user_count,
+            COUNT(DISTINCT i.instrument_id) AS instrument_count,
+            COUNT(DISTINCT CASE
+                WHEN e.visibility IN (?, ?) OR e.organization_id=? THEN e.event_id
+            END) AS event_count,
+            fd.lat, fd.lon, fd.size_ha, fd.address, fd.country, fd.polygon_geojson
+        FROM organization o
+        LEFT JOIN user_account u ON u.organization_id=o.organization_id
+        LEFT JOIN instrument i ON i.organization_id=o.organization_id
+        LEFT JOIN event e ON e.organization_id=o.organization_id
+        LEFT JOIN farm_detail fd ON fd.organization_id=o.organization_id
+        GROUP BY o.organization_id ORDER BY o.name
+    """, (
+        READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]),
+    ))
+
+def get_silos(org_id, user):
+    return get_df("""
+        SELECT s.silo_id, s.name, s.lat, s.lon, s.capacity_tonnes, m.name AS material
+        FROM silo s LEFT JOIN material m ON m.material_id=s.material_id
+        WHERE s.organization_id=?
+    """, (org_id,))
+
+def get_org_materials(org_id, user):
+    return get_df("""
+        SELECT m.name, m.category FROM org_material om
+        JOIN material m ON m.material_id=om.material_id WHERE om.organization_id=?
+    """, (org_id,))
+
+def get_events(org_id, user):
+    return get_df("""
+        SELECT e.event_id, et.code AS event_type, u.full_name AS operator, u.role,
+            i.serial_number AS instrument, e.local_timestamp, e.visibility, e.location_text
+        FROM event e
+        JOIN event_type et ON et.event_type_id=e.event_type_id
+        LEFT JOIN user_account u ON u.user_id=e.operator_user_id
+        LEFT JOIN instrument i ON i.instrument_id=e.instrument_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND e.organization_id=?
+        ORDER BY e.local_timestamp DESC
+    """, event_access_params(user, org_id))
+
+def get_results_for_org(org_id, user):
+    return get_df("""
+        SELECT r.analyte, r.value, r.unit, e.local_timestamp, m.name AS material
+        FROM result r
+        JOIN event e ON e.event_id=r.event_id
+        JOIN sample s ON s.sample_id=e.sample_id
+        JOIN material m ON m.material_id=s.material_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND e.organization_id=?
+        ORDER BY e.local_timestamp DESC
+    """, event_access_params(user, org_id))
+
+def get_last_measurement(org_id, user):
+    con = get_con()
+    row = con.execute("""
+        SELECT e.local_timestamp, e.location_text FROM event e
+        JOIN event_type et ON et.event_type_id=e.event_type_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND e.organization_id=?
+          AND et.code='MEASUREMENT'
+        ORDER BY e.local_timestamp DESC LIMIT 1
+    """, event_access_params(user, org_id)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+def get_event_chain(event_id, user):
+    return get_df("""
+        WITH RECURSIVE chain AS (
+            SELECT e.event_id, e.previous_event_id, et.code AS event_type,
+                   e.local_timestamp, e.organization_id, e.visibility, 0 AS step
+            FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id
+            WHERE e.event_id=?
+              AND (e.visibility IN (?, ?) OR e.organization_id=?)
+            UNION ALL
+            SELECT e.event_id, e.previous_event_id, et.code,
+                   e.local_timestamp, e.organization_id, e.visibility, c.step+1
+            FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id
+            JOIN chain c ON e.event_id=c.previous_event_id
+            WHERE c.step < 20
+              AND (e.visibility IN (?, ?) OR e.organization_id=?)
+        )
+        SELECT step, event_id, event_type, local_timestamp, previous_event_id, visibility
+        FROM chain
+    """, (
+        int(event_id), READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]),
+        READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]),
+    ))

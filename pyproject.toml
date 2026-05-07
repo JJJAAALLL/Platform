@@ -1,0 +1,14 @@
+[project]
+name = "zeutec-db-mock"
+version = "0.1.0"
+description = "Database Modelling and Visualization Dashboard"
+authors = ["Turgut Nasrullayev <t.nasrullayev@zeutec.de>"]
+requires-python = ">=3.10"
+dependencies = [
+    "faker>=40.15.0",
+    "folium>=0.20.0",
+    "pandas>=2.3.3",
+    "plotly>=6.7.0",
+    "streamlit>=1.57.0",
+    "streamlit-folium>=0.26.2",
+]
