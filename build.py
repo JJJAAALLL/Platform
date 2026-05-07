@@ -48,7 +48,7 @@ ROLES_BY_EVENT_TYPE = {
     "FARM_UPDATE":        ["ADMIN","OPERATOR"],
 }
 SCANNING = {"FARMER","MILLER","LAB","ZEUTEC"}
-ANALYTES  = ["Protein","Moisture","Fat","Fiber","Starch","Ash"]
+ANALYTES  = ["Protein","Moisture","Ash","Gluten","Sedimentation","Percentage of Good","Broken Percentage","Damaged Percentage","Foreign Matter Percentage"]
 MODELS    = ["SpectraAlyzer GRAIN NEO","SpectraAlyzer VISION AI","SpectraAlyzer 2.0","SpectraAlyzer Mia"]
 MATERIALS = [("WHEAT","Wheat","GRAIN"),("SOY","Soybean","GRAIN"),("CORN","Corn","GRAIN"),
              ("MILK_PD","Milk Powder","POWDER"),("OIL","Vegetable Oil","LIQUID")]

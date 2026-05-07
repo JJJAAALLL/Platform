@@ -8,7 +8,7 @@ sys.path.insert(0, str(ROOT / "app"))
 
 from access_control import can_edit_org
 from config import DB_PATH, DEMO_PASSWORD
-from db import authenticate_user, get_event_blocks_for_map, get_floating_measurements, get_login_users, get_organizations, get_silos
+from db import authenticate_user, get_event_blocks_for_map, get_floating_measurements, get_login_users, get_measurement_results_for_events, get_organizations, get_silos
 from services.farm_service import (
     PermissionDenied,
     add_silo,
@@ -161,6 +161,36 @@ class BackendPermissionTests(unittest.TestCase):
             & (blocks["organization_id"].astype(int) != self.own_org_id)
         ]
         self.assertTrue(invalid_private.empty)
+        public_db_count = fetchone(
+            "SELECT COUNT(*) AS n FROM event WHERE visibility='PUBLIC'"
+        )["n"]
+        self.assertGreaterEqual(len(blocks[blocks["visibility"] == "PUBLIC"]), public_db_count)
+
+    def test_measurement_results_propagate_to_downstream_blocks(self):
+        row = fetchone(
+            """
+            SELECT sud.silo_update_event_id AS silo_event_id, fma.measurement_event_id
+            FROM silo_update_detail sud
+            JOIN farm_measurement_assignment fma
+              ON fma.farm_update_event_id=sud.source_farm_update_event_id
+            JOIN event silo_event ON silo_event.event_id=sud.silo_update_event_id
+            JOIN event measurement_event ON measurement_event.event_id=fma.measurement_event_id
+            WHERE (silo_event.visibility IN ('PUBLIC', 'SHARED') OR silo_event.organization_id=?)
+              AND (measurement_event.visibility IN ('PUBLIC', 'SHARED') OR measurement_event.organization_id=?)
+            LIMIT 1
+            """,
+            (self.own_org_id, self.own_org_id),
+        )
+        if not row:
+            self.skipTest("Seeded database has no measurement-to-silo lineage.")
+        results = get_measurement_results_for_events([int(row["silo_event_id"])], self.user)
+        self.assertIn(int(row["silo_event_id"]), results)
+        measurement_ids = {entry["measurement_event_id"] for entry in results[int(row["silo_event_id"])]}
+        self.assertIn(int(row["measurement_event_id"]), measurement_ids)
+        result_entry = results[int(row["silo_event_id"])][0]
+        self.assertIn("Protein", result_entry["chemical"])
+        self.assertIn("Variety Type", result_entry["classification"])
+        self.assertIn("Broken Percentage", result_entry["defects"])
 
 
 if __name__ == "__main__":
