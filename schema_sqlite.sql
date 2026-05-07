@@ -143,6 +143,9 @@ CREATE TABLE event (
   location_text     TEXT,
   previous_event_id INTEGER,
   visibility        TEXT    DEFAULT 'PRIVATE' CHECK (visibility IN ('PRIVATE','SHARED','PUBLIC')),
+  lat               REAL,
+  lon               REAL,
+  payload_json      TEXT,
   FOREIGN KEY (event_type_id)     REFERENCES event_type(event_type_id),
   FOREIGN KEY (organization_id)   REFERENCES organization(organization_id),
   FOREIGN KEY (operator_user_id)  REFERENCES user_account(user_id),
@@ -182,6 +185,58 @@ CREATE TABLE result (
   FOREIGN KEY (calibration_id) REFERENCES calibration_model(calibration_id)
 );
 
+CREATE TABLE event_link (
+  event_link_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id         INTEGER NOT NULL,
+  linked_event_id  INTEGER NOT NULL,
+  relationship     TEXT NOT NULL,
+  FOREIGN KEY (event_id)        REFERENCES event(event_id),
+  FOREIGN KEY (linked_event_id) REFERENCES event(event_id)
+);
+
+CREATE TABLE farm_measurement_assignment (
+  farm_update_event_id INTEGER PRIMARY KEY,
+  measurement_event_id INTEGER NOT NULL,
+  farm_detail_id       INTEGER NOT NULL,
+  FOREIGN KEY (farm_update_event_id) REFERENCES event(event_id),
+  FOREIGN KEY (measurement_event_id) REFERENCES event(event_id),
+  FOREIGN KEY (farm_detail_id)       REFERENCES farm_detail(farm_detail_id)
+);
+
+CREATE TABLE silo_update_detail (
+  silo_update_event_id      INTEGER PRIMARY KEY,
+  source_farm_update_event_id INTEGER,
+  silo_id                   INTEGER NOT NULL,
+  amount_added_tonnes       REAL NOT NULL,
+  inventory_after_tonnes    REAL,
+  FOREIGN KEY (silo_update_event_id)        REFERENCES event(event_id),
+  FOREIGN KEY (source_farm_update_event_id) REFERENCES event(event_id),
+  FOREIGN KEY (silo_id)                     REFERENCES silo(silo_id)
+);
+
+CREATE TABLE order_detail (
+  order_event_id       INTEGER PRIMARY KEY,
+  source_event_id      INTEGER NOT NULL,
+  seller_org_id        INTEGER NOT NULL,
+  amount_tonnes        REAL NOT NULL,
+  status               TEXT DEFAULT 'REQUESTED',
+  FOREIGN KEY (order_event_id)  REFERENCES event(event_id),
+  FOREIGN KEY (source_event_id) REFERENCES event(event_id),
+  FOREIGN KEY (seller_org_id)   REFERENCES organization(organization_id)
+);
+
+CREATE TABLE delivery_detail (
+  delivery_event_id INTEGER PRIMARY KEY,
+  order_event_id    INTEGER NOT NULL,
+  source_event_id   INTEGER NOT NULL,
+  carrier_org_id    INTEGER NOT NULL,
+  status            TEXT DEFAULT 'IN_TRANSIT',
+  FOREIGN KEY (delivery_event_id) REFERENCES event(event_id),
+  FOREIGN KEY (order_event_id)    REFERENCES event(event_id),
+  FOREIGN KEY (source_event_id)   REFERENCES event(event_id),
+  FOREIGN KEY (carrier_org_id)    REFERENCES organization(organization_id)
+);
+
 CREATE TABLE soft_data (
   soft_data_id        INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id            INTEGER NOT NULL,
@@ -200,6 +255,12 @@ CREATE INDEX idx_event_org_visibility_timestamp
 
 CREATE INDEX idx_event_previous_event
   ON event(previous_event_id);
+
+CREATE INDEX idx_event_visibility_location
+  ON event(visibility, lat, lon);
+
+CREATE INDEX idx_event_link_event
+  ON event_link(event_id, relationship);
 
 CREATE INDEX idx_silo_organization
   ON silo(organization_id);

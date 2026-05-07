@@ -18,6 +18,11 @@ ROW_COUNT_TABLES = [
     "measurement_image",
     "result",
     "soft_data",
+    "event_link",
+    "farm_measurement_assignment",
+    "silo_update_detail",
+    "order_detail",
+    "delivery_detail",
 ]
 
 SANITY_CHECKS = [
@@ -35,11 +40,11 @@ SANITY_CHECKS = [
     ),
     (
         "Rule 7  role allowed for event type",
-        "SELECT COUNT(*) FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id JOIN user_account u ON u.user_id=e.operator_user_id WHERE (et.code='MEASUREMENT' AND u.role NOT IN('OPERATOR','ANALYST'))OR(et.code='INSTRUMENT_UPDATE' AND u.role NOT IN('ADMIN','ANALYST'))OR(et.code='METHOD_UPDATE' AND u.role NOT IN('ANALYST','ADMIN'))OR(et.code='CALIBRATION_UPDATE' AND u.role NOT IN('ANALYST','ADMIN'))OR(et.code='ORDER' AND u.role NOT IN('TRADER','ADMIN'))OR(et.code='DELIVERY' AND u.role NOT IN('DRIVER'))OR(et.code='FARM_UPDATE' AND u.role NOT IN('ADMIN','OPERATOR'))",
+        "SELECT COUNT(*) FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id JOIN user_account u ON u.user_id=e.operator_user_id WHERE (et.code='MEASUREMENT' AND u.role NOT IN('OPERATOR','ANALYST'))OR(et.code='INSTRUMENT_UPDATE' AND u.role NOT IN('ADMIN','ANALYST'))OR(et.code='METHOD_UPDATE' AND u.role NOT IN('ANALYST','ADMIN'))OR(et.code='CALIBRATION_UPDATE' AND u.role NOT IN('ANALYST','ADMIN'))OR(et.code='ORDER' AND u.role NOT IN('TRADER','ADMIN'))OR(et.code='DELIVERY' AND u.role NOT IN('DRIVER'))OR(et.code='SILO_UPDATE' AND u.role NOT IN('OPERATOR','ANALYST','ADMIN','TRADER','DRIVER'))OR(et.code='FARM_UPDATE' AND u.role NOT IN('ADMIN','OPERATOR'))",
     ),
     (
         "Rule 8  event type allowed for org",
-        "SELECT COUNT(*) FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id JOIN organization o ON o.organization_id=e.organization_id WHERE (o.org_type='FARMER' AND et.code NOT IN('MEASUREMENT','STORAGE_UPDATE','SOFT_DATA','FARM_UPDATE'))OR(o.org_type='MILLER' AND et.code NOT IN('MEASUREMENT','STORAGE_UPDATE','SOFT_DATA','ORDER','FARM_UPDATE'))OR(o.org_type='TRADER' AND et.code NOT IN('ORDER','SOFT_DATA'))OR(o.org_type='BUYER' AND et.code NOT IN('ORDER','SOFT_DATA'))OR(o.org_type='LOGISTICS' AND et.code NOT IN('DELIVERY','SOFT_DATA'))OR(o.org_type='LAB' AND et.code NOT IN('MEASUREMENT','METHOD_UPDATE','CALIBRATION_UPDATE','SOFT_DATA'))OR(o.org_type='ZEUTEC' AND et.code NOT IN('INSTRUMENT_UPDATE','METHOD_UPDATE','CALIBRATION_UPDATE','MEASUREMENT'))",
+        "SELECT COUNT(*) FROM event e JOIN event_type et ON et.event_type_id=e.event_type_id JOIN organization o ON o.organization_id=e.organization_id WHERE (o.org_type='FARMER' AND et.code NOT IN('MEASUREMENT','SILO_UPDATE','SOFT_DATA','FARM_UPDATE'))OR(o.org_type='MILLER' AND et.code NOT IN('MEASUREMENT','SILO_UPDATE','SOFT_DATA','ORDER','FARM_UPDATE'))OR(o.org_type='TRADER' AND et.code NOT IN('ORDER','SOFT_DATA'))OR(o.org_type='BUYER' AND et.code NOT IN('ORDER','SOFT_DATA'))OR(o.org_type='LOGISTICS' AND et.code NOT IN('DELIVERY','SOFT_DATA'))OR(o.org_type='LAB' AND et.code NOT IN('MEASUREMENT','METHOD_UPDATE','CALIBRATION_UPDATE','SOFT_DATA'))OR(o.org_type='ZEUTEC' AND et.code NOT IN('INSTRUMENT_UPDATE','METHOD_UPDATE','CALIBRATION_UPDATE','MEASUREMENT'))",
     ),
     (
         "Rule 9  instruments scanning orgs only",
@@ -68,6 +73,19 @@ SANITY_CHECKS = [
     (
         "Farm detail scanning orgs only",
         "SELECT COUNT(*) FROM farm_detail fd JOIN organization o ON o.organization_id=fd.organization_id WHERE o.org_type NOT IN('FARMER','MILLER','LAB','ZEUTEC')",
+    ),
+
+    (
+        "Farm assignments link FARM_UPDATE to MEASUREMENT",
+        "SELECT COUNT(*) FROM farm_measurement_assignment fma JOIN event fe ON fe.event_id=fma.farm_update_event_id JOIN event_type fet ON fet.event_type_id=fe.event_type_id JOIN event me ON me.event_id=fma.measurement_event_id JOIN event_type met ON met.event_type_id=me.event_type_id WHERE fet.code!='FARM_UPDATE' OR met.code!='MEASUREMENT'",
+    ),
+    (
+        "Silo details are SILO_UPDATE events",
+        "SELECT COUNT(*) FROM silo_update_detail sud JOIN event e ON e.event_id=sud.silo_update_event_id JOIN event_type et ON et.event_type_id=e.event_type_id WHERE et.code!='SILO_UPDATE'",
+    ),
+    (
+        "Orders source visible public/shared silo or farm blocks",
+        "SELECT COUNT(*) FROM order_detail od JOIN event src ON src.event_id=od.source_event_id WHERE src.visibility NOT IN('PUBLIC','SHARED')",
     ),
     (
         "Silos scanning orgs only",

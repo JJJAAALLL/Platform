@@ -143,3 +143,73 @@ def get_event_chain(event_id, user):
         int(event_id), READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]),
         READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]),
     ))
+
+
+def get_event_blocks_for_map(user, limit=1000):
+    """Return all public/shared map blocks plus private blocks owned by the signed-in user's organization."""
+    return get_df(
+        """
+        SELECT e.event_id, et.code AS event_type, e.organization_id, o.name AS organization,
+               o.org_type, e.local_timestamp, e.visibility, e.location_text,
+               e.lat, e.lon, sd.value_text AS note,
+               sud.amount_added_tonnes, od.amount_tonnes AS order_amount_tonnes,
+               dd.status AS delivery_status
+        FROM event e
+        JOIN event_type et ON et.event_type_id=e.event_type_id
+        JOIN organization o ON o.organization_id=e.organization_id
+        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
+        LEFT JOIN silo_update_detail sud ON sud.silo_update_event_id=e.event_id
+        LEFT JOIN order_detail od ON od.order_event_id=e.event_id
+        LEFT JOIN delivery_detail dd ON dd.delivery_event_id=e.event_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND e.lat IS NOT NULL AND e.lon IS NOT NULL
+        GROUP BY e.event_id
+        ORDER BY e.local_timestamp DESC
+        LIMIT ?
+        """,
+        (READABLE_EVENT_VISIBILITY[0], READABLE_EVENT_VISIBILITY[1], int(user["organization_id"]), int(limit)),
+    )
+
+
+def get_floating_measurements(org_id, user):
+    """Measurements that have not yet been assigned to a farm update."""
+    return get_df(
+        """
+        SELECT e.event_id, e.local_timestamp, e.location_text, e.visibility,
+               m.name AS material,
+               GROUP_CONCAT(r.analyte || '=' || ROUND(r.value, 2) || COALESCE(r.unit, ''), ', ') AS results
+        FROM event e
+        JOIN event_type et ON et.event_type_id=e.event_type_id
+        LEFT JOIN sample s ON s.sample_id=e.sample_id
+        LEFT JOIN material m ON m.material_id=s.material_id
+        LEFT JOIN result r ON r.event_id=e.event_id
+        LEFT JOIN farm_measurement_assignment fma ON fma.measurement_event_id=e.event_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND e.organization_id=?
+          AND et.code='MEASUREMENT'
+          AND fma.measurement_event_id IS NULL
+        GROUP BY e.event_id
+        ORDER BY e.local_timestamp DESC
+        LIMIT 100
+        """,
+        event_access_params(user, org_id),
+    )
+
+
+def get_assignable_farm_updates(org_id, user):
+    return get_df(
+        """
+        SELECT e.event_id, e.local_timestamp, e.visibility, sd.value_text AS note
+        FROM event e
+        JOIN event_type et ON et.event_type_id=e.event_type_id
+        LEFT JOIN soft_data sd ON sd.event_id=e.event_id
+        LEFT JOIN silo_update_detail sud ON sud.source_farm_update_event_id=e.event_id
+        WHERE (e.visibility IN (?, ?) OR e.organization_id=?)
+          AND e.organization_id=?
+          AND et.code='FARM_UPDATE'
+          AND sud.source_farm_update_event_id IS NULL
+        ORDER BY e.local_timestamp DESC
+        LIMIT 100
+        """,
+        event_access_params(user, org_id),
+    )

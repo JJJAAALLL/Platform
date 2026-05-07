@@ -11,9 +11,7 @@ We're building a cloud database for Zeutec NIR/Vision instruments that flow data
 across a supply chain (farmers → millers → traders → buyers → logistics).
 This repo is the sandbox to figure out the architecture before touching anything real.
 
-The database is event-centric — everything that happens (a scan, an order, a delivery,
-a farm boundary update) is an **event** in a ledger. Events chain together via
-`previous_event_id` to preserve the causal order per organisation.
+The database is event-centric — everything that happens (a scan, a farm update, a silo update, an order, or a delivery) is an **event block** in a ledger. Events chain together via `previous_event_id` to preserve the causal order per organisation, and cross-organisation supply-chain history is carried with explicit event links/detail tables.
 
 ---
 
@@ -41,6 +39,16 @@ zeutec_db_mock/
 ```
 
 ---
+
+
+## Event-block workflow now modelled
+
+- Farmers can create/update farm records, which writes a `FARM_UPDATE` ledger event.
+- Measurements are generated as independent `MEASUREMENT` blocks and appear as floating measurements on the farm map until assigned.
+- Assigning a measurement to farm land writes a new `FARM_UPDATE` event with measurement lineage in `farm_measurement_assignment` and `event_link`.
+- Storing the measured sample in a silo requires a silo and an amount added; this writes a `SILO_UPDATE` event with `silo_update_detail`.
+- Public/shared farm or silo event blocks appear on the global event map for other users; private blocks are only visible to the owning organisation.
+- Buyers/traders can discover public supply blocks in the seeded data, generate `ORDER` events, and logistics users generate `DELIVERY` events that keep the history chain attached.
 
 ## Setup
 
@@ -71,7 +79,12 @@ If you change the schema, just run `python build.py` again — it wipes and rebu
 | `method` | acquisition recipe used during a scan |
 | `calibration_model` | trained model: one analyte, one algorithm |
 | `event_type` | lookup: MEASUREMENT, ORDER, DELIVERY, FARM_UPDATE, … |
-| `event` | **the main table** — every reportable thing that happens |
+| `event` | **the main table** — every reportable event block, with visibility and optional map coordinates |
+| `event_link` | cross-block lineage, e.g. measurement → farm update → silo update → order → delivery |
+| `farm_measurement_assignment` | connects a FARM_UPDATE block to the MEASUREMENT block assigned to the farm |
+| `silo_update_detail` | amount added to a silo by a SILO_UPDATE block |
+| `order_detail` | order amount and source public/shared supply block |
+| `delivery_detail` | delivery event metadata and the order/source history it carries |
 | `measurement_data` | spectrum URI per scan (actual vectors live in S3, not here) |
 | `measurement_image` | image URI for VISION AI instruments |
 | `result` | predicted analyte values (Protein %, Moisture %, …) |
@@ -113,7 +126,7 @@ and swap to `"CartoDB positron"` for a cleaner grey look or `"Esri WorldImagery"
 
 **Scale up fake data** — edit the N_ constants at the top of `build.py`:
 ```python
-N_EVENTS = 1000   # crank this up to stress test queries
+N_EVENTS = 3000   # thousands of fake event blocks are seeded by default
 ```
 
 ---

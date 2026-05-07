@@ -65,7 +65,7 @@ selected_org_id = org_options[selected_label]
 selected_org = orgs[orgs["organization_id"] == selected_org_id].iloc[0]
 
 st.sidebar.markdown("---")
-page = st.sidebar.radio("Page", ["📊 Overview", "🗺️ Map & Farm", "📋 Events"])
+page = st.sidebar.radio("Page", ["🌍 Event Map", "📊 Overview", "🗺️ Map & Farm", "📋 Events"])
 
 # Store selection in session state so pages can access it
 st.session_state["org_id"]  = selected_org_id
@@ -74,7 +74,9 @@ st.session_state["orgs"]    = orgs
 st.session_state["can_edit_selected_org"] = own_org_id == int(selected_org_id)
 
 # ── Route to page ─────────────────────────────────────────────
-if page == "📊 Overview":
+if page == "🌍 Event Map":
+    from views.event_map import render
+elif page == "📊 Overview":
     from views.overview import render
 elif page == "🗺️ Map & Farm":
     from views.map_view import render

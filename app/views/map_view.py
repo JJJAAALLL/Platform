@@ -8,8 +8,8 @@ import pandas as pd
 import json, sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from access_control import can_edit_org
-from db import get_silos, get_org_materials, get_last_measurement, get_con
-from services.farm_service import add_silo, remove_silo, update_farm_boundary, update_farm_size, update_silo_capacity
+from db import get_silos, get_org_materials, get_last_measurement, get_con, get_floating_measurements, get_assignable_farm_updates
+from services.farm_service import add_silo, assign_measurement_to_farm, remove_silo, store_farm_update_in_silo, update_farm_boundary, update_farm_size, update_silo_capacity
 
 ORG_TYPE_COLOR = {
     "FARMER": "#4CAF50", "MILLER": "#FF9800", "LAB": "#2196F3",
@@ -155,6 +155,47 @@ def render():
             st.rerun()
 
     with col_silos:
+
+        st.subheader("🧪 Floating measurement blocks")
+        st.caption("Measurements start as independent event blocks. Assign one to your farm to create a FARM_UPDATE event with measurement history attached.")
+        floating = get_floating_measurements(org_id, user)
+        if floating.empty:
+            st.info("No unassigned measurements are floating for this organisation.")
+        else:
+            measurement_labels = {
+                f"#{int(row['event_id'])} · {str(row['local_timestamp'])[:19]} · {row.get('material') or 'sample'} · {row.get('results') or 'results pending'}": int(row["event_id"])
+                for _, row in floating.iterrows()
+            }
+            selected_measurement = st.selectbox("Measurement block", list(measurement_labels.keys()))
+            assignment_visibility = st.selectbox("Farm update visibility", ["PRIVATE", "SHARED", "PUBLIC"], help="Public farm updates can be discovered by buyers/traders on the global event map.")
+            if st.button("🌾 Assign measurement to farm", type="primary"):
+                event_id = assign_measurement_to_farm(user, org_id, measurement_labels[selected_measurement], assignment_visibility)
+                st.success(f"FARM_UPDATE event {event_id} created with measurement data attached.")
+                st.rerun()
+
+        st.markdown("---")
+        st.subheader("🏭 Store assigned sample in silo")
+        st.caption("Choose a FARM_UPDATE block, a silo, and the amount added. This generates a SILO_UPDATE event block.")
+        assignable_updates = get_assignable_farm_updates(org_id, user)
+        if assignable_updates.empty or silos.empty:
+            st.info("Create a farm measurement assignment and at least one silo before recording silo storage.")
+        else:
+            update_labels = {
+                f"#{int(row['event_id'])} · {str(row['local_timestamp'])[:19]} · {row.get('visibility')} · {row.get('note') or ''}": int(row["event_id"])
+                for _, row in assignable_updates.iterrows()
+            }
+            silo_labels = {f"{row['name']} (#{int(row['silo_id'])})": int(row["silo_id"]) for _, row in silos.iterrows()}
+            c_store1, c_store2, c_store3 = st.columns([2, 1, 1])
+            selected_update = c_store1.selectbox("Farm update block", list(update_labels.keys()))
+            selected_silo = c_store2.selectbox("Silo", list(silo_labels.keys()))
+            amount_added = c_store3.number_input("Amount added (t)", min_value=0.01, value=10.0, step=1.0)
+            silo_visibility = st.selectbox("Silo update visibility", ["PRIVATE", "SHARED", "PUBLIC"], key="silo_update_visibility")
+            if st.button("📦 Generate SILO_UPDATE"):
+                event_id = store_farm_update_in_silo(user, org_id, update_labels[selected_update], silo_labels[selected_silo], amount_added, silo_visibility)
+                st.success(f"SILO_UPDATE event {event_id} created for {amount_added:.2f} t.")
+                st.rerun()
+
+        st.markdown("---")
         st.subheader("🏭 Manage silos")
 
         # Existing silos

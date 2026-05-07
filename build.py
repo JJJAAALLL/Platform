@@ -1,6 +1,6 @@
 """
-Zeutec mock database — full build v2.
-Adds: farm_detail, silo, org_material, FARM_UPDATE event type.
+Zeutec mock database — full build v3.
+Adds: public/private event blocks, farm measurement assignment, silo/order/delivery lineage.
 Run with: python build.py
 """
 
@@ -16,7 +16,7 @@ fake = Faker()
 random.seed(42)
 Faker.seed(42)
 
-N_USERS=30; N_INSTRUMENTS=10; N_SAMPLES=40; N_METHODS=4; N_CALIBRATIONS=12; N_EVENTS=200
+N_USERS=60; N_INSTRUMENTS=18; N_SAMPLES=160; N_METHODS=6; N_CALIBRATIONS=18; N_EVENTS=3000
 
 ROLE_BY_ORG_TYPE = {
     "FARMER":    ["OPERATOR","ADMIN"],
@@ -28,8 +28,8 @@ ROLE_BY_ORG_TYPE = {
     "ZEUTEC":    ["ANALYST","ADMIN","OPERATOR"],
 }
 EVENT_TYPES_BY_ORG_TYPE = {
-    "FARMER":    ["MEASUREMENT","STORAGE_UPDATE","SOFT_DATA","FARM_UPDATE"],
-    "MILLER":    ["MEASUREMENT","STORAGE_UPDATE","SOFT_DATA","ORDER","FARM_UPDATE"],
+    "FARMER":    ["MEASUREMENT","SILO_UPDATE","SOFT_DATA","FARM_UPDATE"],
+    "MILLER":    ["MEASUREMENT","SILO_UPDATE","SOFT_DATA","ORDER","FARM_UPDATE"],
     "TRADER":    ["ORDER","SOFT_DATA"],
     "BUYER":     ["ORDER","SOFT_DATA"],
     "LOGISTICS": ["DELIVERY","SOFT_DATA"],
@@ -43,7 +43,7 @@ ROLES_BY_EVENT_TYPE = {
     "CALIBRATION_UPDATE": ["ANALYST","ADMIN"],
     "ORDER":              ["TRADER","ADMIN"],
     "DELIVERY":           ["DRIVER"],
-    "STORAGE_UPDATE":     ["OPERATOR","ANALYST","ADMIN","TRADER","DRIVER"],
+    "SILO_UPDATE":     ["OPERATOR","ANALYST","ADMIN","TRADER","DRIVER"],
     "SOFT_DATA":          ["OPERATOR","ANALYST","ADMIN","TRADER","DRIVER"],
     "FARM_UPDATE":        ["ADMIN","OPERATOR"],
 }
@@ -168,9 +168,9 @@ def main():
     # EVENT TYPES
     ET_LIST=[("MEASUREMENT","Spectrum/image captured"),("METHOD_UPDATE","Method created or updated"),
              ("CALIBRATION_UPDATE","Calibration model updated"),("INSTRUMENT_UPDATE","Instrument firmware/config update"),
-             ("SOFT_DATA","Manual annotation"),("STORAGE_UPDATE","Sample placed in storage"),
+             ("SOFT_DATA","Manual annotation"),("SILO_UPDATE","Measured sample stored in a silo"),
              ("ORDER","Purchase order placed"),("DELIVERY","Delivery in transit/completed"),
-             ("FARM_UPDATE","Farm boundary or silo data updated")]
+             ("FARM_UPDATE","Farm boundary, created farm, or measurement assignment updated")]
     et_ids={}
     for code,desc in ET_LIST:
         cur.execute("INSERT INTO event_type(code,description)VALUES(?,?)",(code,desc)); et_ids[code]=cur.lastrowid
@@ -197,7 +197,7 @@ def main():
         cur.execute("INSERT INTO event(event_type_id,organization_id,operator_user_id,instrument_id,method_id,sample_id,local_timestamp,global_timestamp,location_text,previous_event_id,visibility)VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (et_ids[code],oid,op_id,inst_id,meth_id,samp_id,lt.isoformat(),gt.isoformat(),f"{fake.city()},{fake.country_code()}",prev,random.choice(VIS)))
         eid=cur.lastrowid; last_per_org[oid]=eid; ev_by_type[code].append(eid)
-        if code in ("SOFT_DATA","STORAGE_UPDATE","ORDER","DELIVERY","FARM_UPDATE"): soft_event_org[eid]=oid
+        if code in ("SOFT_DATA","SILO_UPDATE","ORDER","DELIVERY","FARM_UPDATE"): soft_event_org[eid]=oid
         if code=="MEASUREMENT": measurements_inst[eid]=inst_id
 
     # MEASUREMENT ARTIFACTS
@@ -219,11 +219,11 @@ def main():
 
     # SOFT + FARM DATA
     TMPLS={"SOFT_DATA":["Operator note: {note}","Lab reference: {note}"],
-           "STORAGE_UPDATE":["Stored in silo {silo}, qty {qty} kg"],
+           "SILO_UPDATE":["Stored in silo {silo}, qty {qty} kg"],
            "ORDER":["Order qty {qty} kg, target price {price} EUR/t"],
            "DELIVERY":["Truck {truck}, status {status}"],
            "FARM_UPDATE":["Farm boundary updated by {user}","Silo {silo} capacity revised to {qty} tonnes"]}
-    for code in ["SOFT_DATA","STORAGE_UPDATE","ORDER","DELIVERY","FARM_UPDATE"]:
+    for code in ["SOFT_DATA","SILO_UPDATE","ORDER","DELIVERY","FARM_UPDATE"]:
         for eid in ev_by_type[code]:
             oid=soft_event_org[eid]; uid,_=random.choice(users_by_org[oid])
             tmpl=random.choice(TMPLS[code])
@@ -232,6 +232,120 @@ def main():
                 truck=fake.bothify("DE-??-####").upper(),status=random.choice(["pending","in_transit","delivered"]),
                 user=fake.name())
             cur.execute("INSERT INTO soft_data(event_id,value_text,recorded_by_user_id)VALUES(?,?,?)",(eid,text,uid))
+
+
+    # PUBLIC/PRIVATE EVENT BLOCK LINEAGE
+    farm_rows = cur.execute("SELECT farm_detail_id, organization_id, lat, lon FROM farm_detail").fetchall()
+    farm_by_org = {row[1]: {"farm_detail_id": row[0], "lat": row[2], "lon": row[3]} for row in farm_rows}
+    silos_by_org = {}
+    for sid, oid, lat, lon, cap in cur.execute("SELECT silo_id, organization_id, lat, lon, capacity_tonnes FROM silo").fetchall():
+        silos_by_org.setdefault(oid, []).append((sid, lat, lon, cap or 0))
+
+    # Give every event block a map coordinate, inherited from its farm/org when possible.
+    for oid, info in farm_by_org.items():
+        cur.execute(
+            "UPDATE event SET lat=COALESCE(lat, ?), lon=COALESCE(lon, ?) WHERE organization_id=?",
+            (info["lat"], info["lon"], oid),
+        )
+
+    def append_event(code, oid, operator_id, when, note, visibility="PRIVATE", lat=None, lon=None, payload=None, source_event_id=None):
+        prev = last_per_org.get(oid)
+        global_when = when + timedelta(seconds=random.randint(1, 30))
+        cur.execute(
+            """
+            INSERT INTO event(event_type_id,organization_id,operator_user_id,local_timestamp,global_timestamp,
+                              location_text,previous_event_id,visibility,lat,lon,payload_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                et_ids[code], oid, operator_id, when.isoformat(), global_when.isoformat(),
+                f"{fake.city()},{fake.country_code()}", prev, visibility, lat, lon,
+                json.dumps(payload or {}),
+            ),
+        )
+        eid = cur.lastrowid
+        last_per_org[oid] = eid
+        ev_by_type[code].append(eid)
+        soft_event_org[eid] = oid
+        cur.execute("INSERT INTO soft_data(event_id,value_text,recorded_by_user_id)VALUES(?,?,?)", (eid, note, operator_id))
+        if source_event_id:
+            cur.execute(
+                "INSERT INTO event_link(event_id,linked_event_id,relationship)VALUES(?,?,?)",
+                (eid, source_event_id, "SOURCE_BLOCK"),
+            )
+        return eid
+
+    farmer_orgs = [oid for oid, ot in org_type_by_id.items() if ot == "FARMER" and oid in farm_by_org]
+    buyer_orgs = [oid for oid, ot in org_type_by_id.items() if ot in ("BUYER", "TRADER", "MILLER")]
+    logistics_orgs = [oid for oid, ot in org_type_by_id.items() if ot == "LOGISTICS"]
+    scenario_count = min(120, len(ev_by_type["MEASUREMENT"]))
+    for idx, measurement_event_id in enumerate(ev_by_type["MEASUREMENT"][:scenario_count]):
+        measurement = cur.execute("SELECT organization_id, sample_id, local_timestamp FROM event WHERE event_id=?", (measurement_event_id,)).fetchone()
+        oid = measurement[0]
+        if oid not in farm_by_org or not silos_by_org.get(oid) or "FARM_UPDATE" not in EVENT_TYPES_BY_ORG_TYPE[org_type_by_id[oid]]:
+            continue
+        farmer_ops = [u for u, r in users_by_org[oid] if r in ("ADMIN", "OPERATOR")]
+        if not farmer_ops:
+            continue
+        op_id = random.choice(farmer_ops)
+        farm = farm_by_org[oid]
+        created_at = datetime.fromisoformat(measurement[2]) + timedelta(minutes=5)
+        visibility = "PUBLIC" if idx % 3 == 0 else random.choice(["PRIVATE", "SHARED"])
+        farm_update_id = append_event(
+            "FARM_UPDATE", oid, op_id, created_at,
+            f"Measurement event_id={measurement_event_id} assigned to farm_detail_id={farm['farm_detail_id']}",
+            visibility, farm["lat"], farm["lon"],
+            {"action": "ASSIGN_MEASUREMENT_TO_FARM", "measurement_event_id": measurement_event_id},
+            measurement_event_id,
+        )
+        cur.execute(
+            "INSERT INTO farm_measurement_assignment(farm_update_event_id,measurement_event_id,farm_detail_id)VALUES(?,?,?)",
+            (farm_update_id, measurement_event_id, farm["farm_detail_id"]),
+        )
+        silo_id, silo_lat, silo_lon, cap = random.choice(silos_by_org[oid])
+        amount = round(random.uniform(5, min(max(cap, 10), 250)), 2)
+        silo_update_id = append_event(
+            "SILO_UPDATE", oid, op_id, created_at + timedelta(minutes=15),
+            f"Stored measured sample from FARM_UPDATE event_id={farm_update_id} in silo_id={silo_id}; amount_added_tonnes={amount}",
+            visibility, silo_lat, silo_lon,
+            {"source_farm_update_event_id": farm_update_id, "silo_id": silo_id, "amount_added_tonnes": amount},
+            farm_update_id,
+        )
+        cur.execute(
+            "INSERT INTO silo_update_detail(silo_update_event_id,source_farm_update_event_id,silo_id,amount_added_tonnes,inventory_after_tonnes)VALUES(?,?,?,?,?)",
+            (silo_update_id, farm_update_id, silo_id, amount, amount),
+        )
+        if visibility == "PUBLIC" and buyer_orgs:
+            buyer_oid = random.choice([b for b in buyer_orgs if b != oid] or buyer_orgs)
+            buyer_ops = [u for u, r in users_by_org[buyer_oid] if r in ("TRADER", "ADMIN")]
+            if buyer_ops:
+                order_amount = round(random.uniform(1, amount), 2)
+                order_id = append_event(
+                    "ORDER", buyer_oid, random.choice(buyer_ops), created_at + timedelta(hours=1),
+                    f"Order requested from public SILO_UPDATE event_id={silo_update_id}; amount_tonnes={order_amount}",
+                    "PUBLIC", silo_lat, silo_lon,
+                    {"source_event_id": silo_update_id, "seller_org_id": oid, "amount_tonnes": order_amount},
+                    silo_update_id,
+                )
+                cur.execute(
+                    "INSERT INTO order_detail(order_event_id,source_event_id,seller_org_id,amount_tonnes,status)VALUES(?,?,?,?,?)",
+                    (order_id, silo_update_id, oid, order_amount, "REQUESTED"),
+                )
+                if logistics_orgs:
+                    log_oid = random.choice(logistics_orgs)
+                    drivers = [u for u, r in users_by_org[log_oid] if r == "DRIVER"]
+                    if drivers:
+                        delivery_id = append_event(
+                            "DELIVERY", log_oid, random.choice(drivers), created_at + timedelta(hours=3),
+                            f"Delivery created for ORDER event_id={order_id}; carrying history from event_id={silo_update_id}",
+                            "PUBLIC", silo_lat, silo_lon,
+                            {"order_event_id": order_id, "source_event_id": silo_update_id, "status": "IN_TRANSIT"},
+                            order_id,
+                        )
+                        cur.execute(
+                            "INSERT INTO delivery_detail(delivery_event_id,order_event_id,source_event_id,carrier_org_id,status)VALUES(?,?,?,?,?)",
+                            (delivery_id, order_id, silo_update_id, log_oid, "IN_TRANSIT"),
+                        )
 
     con.commit()
 
